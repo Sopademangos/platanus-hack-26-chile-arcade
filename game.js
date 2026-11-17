@@ -1,39 +1,24 @@
-// Platanus Hack 26 — Santiago Edition
-// Two-player brick duel. Dash with Button 1, break the word, keep your paddle alive.
+// Combinación: Hora Punta — Platanus Hack 26, Santiago
+// You are the manual dispatcher of the Santiago Metro. Flip the switches at the
+// transfer stations so every train leaves through the line of its own colour.
 
-const GAME_WIDTH = 800;
-const GAME_HEIGHT = 600;
-const STORAGE_KEY = 'platanus-hack-26-standard-highscores';
-const MAX_HIGH_SCORES = 5;
-const WINNING_NAME_LENGTH = 3;
-
-const COLORS = {
-  background: 0x0b0f03,
-  frame: 0x3a3a0a,
-  accent: 0xe1ff00,
-  accentSoft: 0xa8c700,
-  p1: 0xe1ff00,
-  p2: 0xff6ec7,
-  red: 0xff7a7a,
-  white: 0xf7ffd8,
-  slate: 0xb8c48d,
-  cell: 0x1a1e05,
-  overlay: 0x0c0e02,
-  backdrop: 0x030504,
-  fieldBg: 0x0a0d0b,
-  brickA: 0x3f4a0e,
-  brickB: 0x6b7f14,
-  brickC: 0xa8c700,
-  brickD: 0xe1ff00,
-};
-
-const LETTER_GRID = [
-  ['A', 'B', 'C', 'D', 'E', 'F', 'G'],
-  ['H', 'I', 'J', 'K', 'L', 'M', 'N'],
-  ['O', 'P', 'Q', 'R', 'S', 'T', 'U'],
-  ['V', 'W', 'X', 'Y', 'Z', '.', '-'],
-  ['DEL', 'END'],
-];
+const W = 800;
+const H = 600;
+const BG = 0x090b11;
+const GREY = 0x2b3040; // colour of lines that are not inaugurated yet
+const STORE_KEY = 'combinacion-hora-punta-top';
+const START_LIVES = 3;
+const MAX_LIVES = 5;
+const LIFE_BONUS = 500; // survival bonus per life held when a rush hour ends
+const BASE_POINTS = 100; // points for a correctly routed train, before the combo
+const COMBO_STEP = 5; // consecutive trains needed to raise the multiplier
+// One neon colour per multiplier tier, x1..x5. Its length is the multiplier cap.
+const COMBO_COLORS = [0x3d8bff, 0x17d68a, 0xffc928, 0xff8a3d, 0xff4fd8];
+const MAX_COMBO = COMBO_COLORS.length;
+const START_LINES = 2; // how many entries of LINES are open when a game begins
+const CALM_SECONDS = 30; // time between rush hours
+const RUSH_SECONDS = 10; // rush hour length
+const FONT = 'monospace';
 
 // DO NOT replace existing keys — they match the physical arcade cabinet wiring.
 // To add local testing shortcuts, append extra keys to any array.
@@ -62,1664 +47,1170 @@ const CABINET_KEYS = {
   START2: ['2'],
 };
 
-const KEYBOARD_TO_ARCADE = {};
-for (const [arcadeCode, keys] of Object.entries(CABINET_KEYS)) {
-  for (const key of keys) {
-    KEYBOARD_TO_ARCADE[normalizeIncomingKey(key)] = arcadeCode;
-  }
+const normKey = (k) => (typeof k === 'string' && k ? (k === ' ' ? 'space' : k.toLowerCase()) : '');
+const KEY_TO_CODE = {};
+for (const [code, keys] of Object.entries(CABINET_KEYS)) {
+  for (const k of keys) KEY_TO_CODE[normKey(k)] = code;
 }
 
-const config = {
-  type: Phaser.AUTO,
-  width: GAME_WIDTH,
-  height: GAME_HEIGHT,
-  parent: 'game-root',
-  backgroundColor: '#0b0f03',
-  physics: {
-    default: 'arcade',
-    arcade: {
-      gravity: { y: 0 },
-      debug: false,
-    },
-  },
-  scale: {
-    mode: Phaser.Scale.FIT,
-    autoCenter: Phaser.Scale.CENTER_BOTH,
-    width: GAME_WIDTH,
-    height: GAME_HEIGHT,
-  },
-  scene: {
-    preload,
-    create,
-    update,
-  },
+// ---------------------------------------------------------------------------
+// THE MAP — a directed graph. Everything below is data; the engine reads it.
+//
+// HOW TO ADD A LINE:   add an entry to LINES (colour + badge label). The ORDER
+//   of LINES is the inauguration order: the first START_LINES are open from
+//   the start, each following one opens after a survived rush hour.
+// HOW TO ADD A SWITCH: add an entry to NODES, then make edges start/end on it.
+//   A switch only becomes active once both lines through it are open.
+//   keys: arcade code suffixes that flip it ('L' = joystick left of either
+//         player, '1' = button 1 of either player, etc.)
+//   tx/ty/ta: name label offset and horizontal anchor (0 left, 1 right)
+//   bx/by: control hint badge offset; dir: joystick arrow angle in degrees
+//          (leave dir out for button-only switches)
+// HOW TO ADD TRACK:    add an entry to EDGES. Trains only travel pts[0] -> last.
+//   from: null means "spawn point" (start it off-screen)
+//   to:   null means "terminal" (trains score there if their colour matches)
+//   An edge that ends on a node must end exactly on the node's x/y, and an edge
+//   that leaves a node must start on it. Each node needs exactly two incoming
+//   and two outgoing edges, one per line, and the graph must have no loops.
+// ---------------------------------------------------------------------------
+const LINES = {
+  L1: { color: 0xff3347, label: 'L1' },
+  L2: { color: 0xffc928, label: 'L2' },
+  L5: { color: 0x17d68a, label: 'L5' },
+  L6: { color: 0xa35bff, label: 'L6' },
+  L4: { color: 0x3d8bff, label: 'L4' },
 };
 
-new Phaser.Game(config);
-
-function preload() {}
-
-function create() {
-  const scene = this;
-
-  scene.state = {
-    phase: 'loading',
-    scores: { p1: 0, p2: 0 },
-    remainingBricks: 0,
-    highScores: [],
-    winner: null,
-    winnerLabel: '',
-    saveStatus: 'Loading scores...',
-    menu: { cursor: 0, cooldown: 0, lastAxis: 0 },
-    dash: {
-      p1: { activeUntil: 0, cooldownUntil: 0, dir: 0 },
-      p2: { activeUntil: 0, cooldownUntil: 0, dir: 0 },
-    },
-    nameEntry: {
-      letters: [],
-      row: 0,
-      col: 0,
-      moveCooldownUntil: 0,
-      confirmCooldownUntil: 0,
-      lastMoveVector: { x: 0, y: 0 },
-    },
-  };
-
-  scene.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, GAME_WIDTH, GAME_HEIGHT, COLORS.background);
-  scene.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, 760, 560, 0x141a04, 0.94).setStrokeStyle(4, COLORS.frame, 0.8);
-
-  createBackground(scene);
-  createHud(scene);
-  createPlayfield(scene);
-  createEndGameUi(scene);
-  createStartScreen(scene);
-  createLeaderboardScreen(scene);
-  createControlsScreen(scene);
-  createPauseScreen(scene);
-  createControls(scene);
-  showStartScreen(scene);
-
-  loadHighScores()
-    .then((highScores) => {
-      scene.state.highScores = highScores;
-      scene.state.saveStatus = 'Finish a duel to save a score.';
-      refreshLeaderboard(scene);
-      refreshStartScreenLeaderboard(scene);
-    })
-    .catch(() => {
-      scene.state.highScores = [];
-      scene.state.saveStatus = 'Storage unavailable. Match runs without saves.';
-      refreshLeaderboard(scene);
-      refreshStartScreenLeaderboard(scene);
-    });
-}
-
-function update(time, delta) {
-  const scene = this;
-  if (!scene.state) {
-    return;
-  }
-
-  const phase = scene.state.phase;
-
-  if (phase === 'start') {
-    handleStartMenu(scene, time);
-    return;
-  }
-
-  if (phase === 'leaderboard') {
-    if (consumeAnyPressedControl(scene, ['START1', 'START2', 'P1_1', 'P2_1', 'P1_2', 'P2_2'])) {
-      scene.leaderScreen.container.setVisible(false);
-      showStartScreen(scene);
-    }
-    return;
-  }
-
-  if (phase === 'controls') {
-    if (consumeAnyPressedControl(scene, ['START1', 'START2', 'P1_1', 'P2_1', 'P1_2', 'P2_2'])) {
-      scene.controlsScreen.container.setVisible(false);
-      showStartScreen(scene);
-    }
-    return;
-  }
-
-  if (phase === 'playing') {
-    updatePaddles(scene, delta, time);
-    updateBallGhostStates(scene);
-    updateBallTrails(scene, time);
-    checkBallEscape(scene);
-    if (consumeAnyPressedControl(scene, ['START1', 'START2'])) {
-      pauseMatch(scene);
-    }
-    return;
-  }
-
-  if (phase === 'paused') {
-    if (consumeAnyPressedControl(scene, ['START1', 'START2'])) {
-      resumeMatch(scene);
-    }
-    return;
-  }
-
-  if (phase === 'gameover') {
-    handleNameEntry(scene, time);
-    return;
-  }
-
-  if (phase === 'saved') {
-    if (consumeAnyPressedControl(scene, ['START1', 'START2', 'P1_1', 'P2_1', 'P1_2', 'P2_2'])) {
-      returnToStart(scene);
-    }
-  }
-}
-
-function createBackground(scene) {
-  scene.add.rectangle(
-    GAME_WIDTH / 2,
-    GAME_HEIGHT / 2,
-    700,
-    450,
-    COLORS.fieldBg,
-    0.18,
-  );
-}
-
-function createHud(scene) {
-  scene.hud = {};
-
-  scene.hud.title = scene.add
-    .text(GAME_WIDTH / 2, 20, 'PLATANUS HACK 26 BRICKS', {
-      fontFamily: 'monospace',
-      fontSize: '22px',
-      color: '#f7fbff',
-      fontStyle: 'bold',
-      align: 'center',
-    })
-    .setOrigin(0.5, 0);
-
-  scene.hud.subtitle = scene.add
-    .text(
-      GAME_WIDTH / 2,
-      48,
-      '',
-      {
-        fontFamily: 'monospace',
-        fontSize: '11px',
-        color: '#a8ad8a',
-        align: 'center',
-      },
-    )
-    .setOrigin(0.5, 0);
-
-  scene.hud.p1Score = scene.add
-    .text(65, 72, 'P1 00', {
-      fontFamily: 'monospace',
-      fontSize: '28px',
-      color: '#e1ff00',
-      fontStyle: 'bold',
-    })
-    .setOrigin(0, 0.5);
-
-  scene.hud.p2Score = scene.add
-    .text(GAME_WIDTH - 65, 72, 'P2 00', {
-      fontFamily: 'monospace',
-      fontSize: '28px',
-      color: '#ff6ec7',
-      fontStyle: 'bold',
-    })
-    .setOrigin(1, 0.5);
-
-  scene.hud.remaining = scene.add
-    .text(GAME_WIDTH / 2, 72, 'BRICKS 000', {
-      fontFamily: 'monospace',
-      fontSize: '18px',
-      color: '#ffd84d',
-      fontStyle: 'bold',
-    })
-    .setOrigin(0.5);
-
-  scene.hud.status = scene.add
-    .text(GAME_WIDTH / 2, GAME_HEIGHT - 24, '', {
-      fontFamily: 'monospace',
-      fontSize: '14px',
-      color: '#f7fbff',
-      align: 'center',
-    })
-    .setOrigin(0.5);
-
-  scene.hud.scoreColors = {
-    p1: '#e1ff00',
-    p2: '#ff6ec7',
-    penalty: '#ff7a7a',
-  };
-}
-
-function createPlayfield(scene) {
-  scene.playfield = {};
-  const paddleWidth = 112;
-  const paddleHeight = 10;
-  const topBounceLineY = 118;
-  const bottomBounceLineY = GAME_HEIGHT - 72;
-  const wallThickness = 8;
-  const wallGap = 22;
-  const topPaddleY = topBounceLineY - paddleHeight / 2;
-  const bottomPaddleY = bottomBounceLineY + paddleHeight / 2;
-  const topWallY = topBounceLineY - wallGap - wallThickness / 2;
-  const bottomWallY = bottomBounceLineY + wallGap + wallThickness / 2;
-
-  // Walls span full width/height so corners are sealed — balls cannot escape through gaps.
-  scene.playfield.leftWall = scene.add.rectangle(38, GAME_HEIGHT / 2, 14, GAME_HEIGHT, COLORS.frame, 0);
-  scene.playfield.rightWall = scene.add.rectangle(GAME_WIDTH - 38, GAME_HEIGHT / 2, 14, GAME_HEIGHT, COLORS.frame, 0);
-  scene.playfield.topWall = scene.add.rectangle(
-    GAME_WIDTH / 2,
-    topWallY,
-    GAME_WIDTH,
-    wallThickness,
-    COLORS.frame,
-    0,
-  );
-  scene.playfield.bottomWall = scene.add.rectangle(
-    GAME_WIDTH / 2,
-    bottomWallY,
-    GAME_WIDTH,
-    wallThickness,
-    COLORS.frame,
-    0,
-  );
-
-  scene.physics.add.existing(scene.playfield.leftWall, true);
-  scene.physics.add.existing(scene.playfield.rightWall, true);
-  scene.physics.add.existing(scene.playfield.topWall, true);
-  scene.physics.add.existing(scene.playfield.bottomWall, true);
-
-  scene.add.rectangle(
-    GAME_WIDTH / 2,
-    topBounceLineY,
-    700,
-    1,
-    COLORS.frame,
-    0.55,
-  );
-  scene.add.rectangle(
-    GAME_WIDTH / 2,
-    bottomBounceLineY,
-    700,
-    1,
-    COLORS.frame,
-    0.55,
-  );
-
-  scene.playfield.p1Paddle = scene.add.rectangle(
-    GAME_WIDTH / 2,
-    topPaddleY,
-    paddleWidth,
-    paddleHeight,
-    COLORS.p1,
-    1,
-  );
-  scene.playfield.p2Paddle = scene.add.rectangle(
-    GAME_WIDTH / 2,
-    bottomPaddleY,
-    paddleWidth,
-    paddleHeight,
-    COLORS.p2,
-    1,
-  );
-
-  scene.physics.add.existing(scene.playfield.p1Paddle);
-  scene.physics.add.existing(scene.playfield.p2Paddle);
-
-  configurePaddleBody(scene.playfield.p1Paddle.body);
-  configurePaddleBody(scene.playfield.p2Paddle.body);
-
-  scene.playfield.balls = [
-    createBall(scene, GAME_WIDTH / 2 - 120, 170, COLORS.white, 'p1'),
-    createBall(scene, GAME_WIDTH / 2 + 120, GAME_HEIGHT - 170, COLORS.white, 'p2'),
-  ];
-
-  scene.playfield.bricks = scene.physics.add.staticGroup();
-  scene.playfield.ballTrails = scene.add.group();
-
-  for (const ball of scene.playfield.balls) {
-    scene.physics.add.collider(ball, scene.playfield.leftWall);
-    scene.physics.add.collider(ball, scene.playfield.rightWall);
-    scene.physics.add.collider(ball, scene.playfield.topWall);
-    scene.physics.add.collider(ball, scene.playfield.bottomWall);
-    scene.physics.add.collider(
-      ball,
-      scene.playfield.p1Paddle,
-      () => handleBallPaddleCollision(scene, ball, scene.playfield.p1Paddle, 'p1'),
-      () => canBallCollideWithPaddle(ball, 'p1'),
-      scene,
-    );
-    scene.physics.add.collider(
-      ball,
-      scene.playfield.p2Paddle,
-      () => handleBallPaddleCollision(scene, ball, scene.playfield.p2Paddle, 'p2'),
-      () => canBallCollideWithPaddle(ball, 'p2'),
-      scene,
-    );
-    scene.physics.add.collider(
-      ball,
-      scene.playfield.bricks,
-      (_, brick) => handleBallBrickCollision(scene, ball, brick),
-      undefined,
-      scene,
-    );
-  }
-}
-
-function createEndGameUi(scene) {
-  scene.endGame = {};
-
-  scene.endGame.container = scene.add.container(0, 0);
-  scene.endGame.container.setDepth(20);
-  scene.endGame.container.setVisible(false);
-
-  const backdrop = scene.add.rectangle(
-    GAME_WIDTH / 2,
-    GAME_HEIGHT / 2,
-    GAME_WIDTH,
-    GAME_HEIGHT,
-    COLORS.backdrop,
-    0.98,
-  );
-  scene.endGame.container.add(backdrop);
-
-  scene.endGame.title = scene.add
-    .text(GAME_WIDTH / 2, 88, 'GAME OVER', {
-      fontFamily: 'monospace',
-      fontSize: '30px',
-      color: '#f7ffd8',
-      fontStyle: 'bold',
-    })
-    .setOrigin(0.5);
-
-  scene.endGame.summary = scene.add
-    .text(GAME_WIDTH / 2, 126, '', {
-      fontFamily: 'monospace',
-      fontSize: '22px',
-      color: '#e1ff00',
-      align: 'center',
-    })
-    .setOrigin(0.5);
-
-  scene.endGame.nameLabel = scene.add
-    .text(GAME_WIDTH / 2, 172, '', {
-      fontFamily: 'monospace',
-      fontSize: '13px',
-      color: '#a8ad8a',
-      align: 'center',
-    })
-    .setOrigin(0.5);
-
-  scene.endGame.nameValue = scene.add
-    .text(GAME_WIDTH / 2, 208, '___', {
-      fontFamily: 'monospace',
-      fontSize: '36px',
-      color: '#ff6ec7',
-      fontStyle: 'bold',
-      align: 'center',
-      letterSpacing: 10,
-    })
-    .setOrigin(0.5);
-
-  scene.endGame.instructions = scene.add
-    .text(
-      GAME_WIDTH / 2,
-      242,
-      'MOVE  PICK',
-      {
-        fontFamily: 'monospace',
-        fontSize: '11px',
-        color: '#a8ad8a',
-        align: 'center',
-      },
-    )
-    .setOrigin(0.5);
-
-  scene.endGame.leaderboardTitle = scene.add
-    .text(GAME_WIDTH / 2, 286, 'SCOREBOARD', {
-      fontFamily: 'monospace',
-      fontSize: '14px',
-      color: '#e1ff00',
-      fontStyle: 'bold',
-      align: 'center',
-    })
-    .setOrigin(0.5);
-
-  scene.endGame.gridLabels = [];
-
-  for (let row = 0; row < LETTER_GRID.length; row += 1) {
-    const rowValues = LETTER_GRID[row];
-    const rowWidth = rowValues.length * 56;
-    for (let col = 0; col < rowValues.length; col += 1) {
-      const value = rowValues[col];
-      const cellX = GAME_WIDTH / 2 - rowWidth / 2 + 28 + col * 56;
-      const cellY = 430 + row * 28;
-
-      const cell = scene.add.rectangle(cellX, cellY, value.length > 1 ? 64 : 42, 24, COLORS.cell, 0.95);
-      cell.setStrokeStyle(2, COLORS.frame, 0.8);
-
-      const label = scene.add
-        .text(cellX, cellY, value, {
-          fontFamily: 'monospace',
-          fontSize: value.length > 1 ? '14px' : '18px',
-          color: '#f7fbff',
-          fontStyle: 'bold',
-          align: 'center',
-        })
-        .setOrigin(0.5);
-
-      scene.endGame.gridLabels.push({ cell, label, row, col, value });
-      scene.endGame.container.add(cell);
-      scene.endGame.container.add(label);
-    }
-  }
-
-  scene.endGame.saveStatus = scene.add
-    .text(GAME_WIDTH / 2, 590, '', {
-      fontFamily: 'monospace',
-      fontSize: '11px',
-      color: '#e1ff00',
-      align: 'center',
-    })
-    .setOrigin(0.5);
-
-  scene.endGame.leaderboard = scene.add
-    .text(GAME_WIDTH / 2, 308, '', {
-      fontFamily: 'monospace',
-      fontSize: '12px',
-      color: '#f7ffd8',
-      align: 'center',
-      lineSpacing: 4,
-    })
-    .setOrigin(0.5, 0);
-
-  scene.endGame.container.add(scene.endGame.title);
-  scene.endGame.container.add(scene.endGame.summary);
-  scene.endGame.container.add(scene.endGame.nameLabel);
-  scene.endGame.container.add(scene.endGame.nameValue);
-  scene.endGame.container.add(scene.endGame.instructions);
-  scene.endGame.container.add(scene.endGame.leaderboardTitle);
-  scene.endGame.container.add(scene.endGame.leaderboard);
-  scene.endGame.container.add(scene.endGame.saveStatus);
-}
-
-function createControls(scene) {
-  scene.controls = {
-    held: Object.create(null),
-    pressed: Object.create(null),
-  };
-
-  const onKeyDown = (event) => {
-    const key = normalizeIncomingKey(event.key);
-    if (!key) {
-      return;
-    }
-
-    const arcadeCode = KEYBOARD_TO_ARCADE[key];
-    if (!arcadeCode) {
-      return;
-    }
-
-    if (!scene.controls.held[arcadeCode]) {
-      scene.controls.pressed[arcadeCode] = true;
-    }
-    scene.controls.held[arcadeCode] = true;
-  };
-
-  const onKeyUp = (event) => {
-    const key = normalizeIncomingKey(event.key);
-    if (!key) {
-      return;
-    }
-
-    const arcadeCode = KEYBOARD_TO_ARCADE[key];
-    if (!arcadeCode) {
-      return;
-    }
-
-    scene.controls.held[arcadeCode] = false;
-  };
-
-  window.addEventListener('keydown', onKeyDown);
-  window.addEventListener('keyup', onKeyUp);
-
-  scene.events.once('shutdown', () => {
-    window.removeEventListener('keydown', onKeyDown);
-    window.removeEventListener('keyup', onKeyUp);
-  });
-}
-
-function startMatch(scene) {
-  scene.physics.resume();
-  scene.startScreen.container.setVisible(false);
-  buildTextBricks(scene);
-  resetBalls(scene);
-  scene.state.scores = { p1: 0, p2: 0 };
-  refreshHud(scene);
-  scene.state.phase = 'playing';
-  scene.hud.status.setText('');
-}
-
-function createStartScreen(scene) {
-  scene.startScreen = {};
-  const c = scene.add.container(0, 0);
-  c.setDepth(15);
-  scene.startScreen.container = c;
-
-  c.add(scene.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, GAME_WIDTH, GAME_HEIGHT, COLORS.overlay, 0.97));
-
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, 88, 'PLATANUS HACK 26', {
-        fontFamily: 'monospace', fontSize: '16px', color: '#a8c700',
-      })
-      .setOrigin(0.5),
-  );
-  const titleMain = scene.add
-    .text(GAME_WIDTH / 2, 150, 'SANTIAGO EDITION', {
-      fontFamily: 'monospace', fontSize: '38px', color: '#e1ff00', fontStyle: 'bold',
-    })
-    .setOrigin(0.5);
-  c.add(titleMain);
-  scene.tweens.add({
-    targets: titleMain,
-    scale: 1.025,
-    alpha: 0.88,
-    duration: 1100,
-    yoyo: true,
-    repeat: -1,
-    ease: 'Sine.easeInOut',
-  });
-
-  scene.startScreen.buttons = [];
-  const buttonLabels = ['PLAY', 'LEADERBOARD', 'CONTROLS'];
-  for (let i = 0; i < buttonLabels.length; i += 1) {
-    const y = 232 + i * 50;
-    const bg = scene.add.rectangle(GAME_WIDTH / 2, y, 280, 42, COLORS.cell, 0.95);
-    bg.setStrokeStyle(2, COLORS.frame, 0.8);
-    const label = scene.add
-      .text(GAME_WIDTH / 2, y, buttonLabels[i], {
-        fontFamily: 'monospace', fontSize: '22px', color: '#f7ffd8', fontStyle: 'bold',
-      })
-      .setOrigin(0.5);
-    c.add(bg);
-    c.add(label);
-    scene.startScreen.buttons.push({ bg, label });
-  }
-
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, 380, 'SCOREBOARD', {
-        fontFamily: 'monospace', fontSize: '14px', color: '#e1ff00', fontStyle: 'bold',
-      })
-      .setOrigin(0.5),
-  );
-  scene.startScreen.leaderboard = scene.add
-    .text(GAME_WIDTH / 2, 402, '', {
-      fontFamily: 'monospace', fontSize: '13px', color: '#f7ffd8', align: 'center', lineSpacing: 4,
-    })
-    .setOrigin(0.5, 0);
-  c.add(scene.startScreen.leaderboard);
-
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, GAME_HEIGHT - 22, 'MOVE ↕   CONFIRM B / START', {
-        fontFamily: 'monospace', fontSize: '11px', color: '#6f7a4a',
-      })
-      .setOrigin(0.5),
-  );
-
-  c.setVisible(false);
-}
-
-function showStartScreen(scene) {
-  scene.state.phase = 'start';
-  scene.state.menu = { cursor: 0, cooldown: 0, lastAxis: 0 };
-  refreshStartScreenLeaderboard(scene);
-  updateStartMenuHighlight(scene);
-  scene.startScreen.container.setVisible(true);
-}
-
-function createLeaderboardScreen(scene) {
-  scene.leaderScreen = {};
-  const c = scene.add.container(0, 0);
-  c.setDepth(16);
-  scene.leaderScreen.container = c;
-
-  c.add(scene.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, GAME_WIDTH, GAME_HEIGHT, COLORS.overlay, 0.98));
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, 90, 'LEADERBOARD', {
-        fontFamily: 'monospace', fontSize: '30px', color: '#e1ff00', fontStyle: 'bold',
-      })
-      .setOrigin(0.5),
-  );
-
-  scene.leaderScreen.list = scene.add
-    .text(GAME_WIDTH / 2, 160, '', {
-      fontFamily: 'monospace', fontSize: '20px', color: '#f7ffd8',
-      align: 'center', lineSpacing: 12,
-    })
-    .setOrigin(0.5, 0);
-  c.add(scene.leaderScreen.list);
-
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, GAME_HEIGHT - 28, 'PRESS START TO GO BACK', {
-        fontFamily: 'monospace', fontSize: '12px', color: '#6f7a4a',
-      })
-      .setOrigin(0.5),
-  );
-
-  c.setVisible(false);
-}
-
-function createControlsScreen(scene) {
-  scene.controlsScreen = {};
-  const c = scene.add.container(0, 0);
-  c.setDepth(16);
-  scene.controlsScreen.container = c;
-
-  c.add(scene.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, GAME_WIDTH, GAME_HEIGHT, COLORS.overlay, 0.98));
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, 110, 'CONTROLS', {
-        fontFamily: 'monospace', fontSize: '30px', color: '#e1ff00', fontStyle: 'bold',
-      })
-      .setOrigin(0.5),
-  );
-
-  const lines = [
-    'P1   MOVE  A / D',
-    'P1   DASH  U',
-    '',
-    'P2   MOVE  ← / →',
-    'P2   DASH  R',
-    '',
-    'PAUSE      ENTER',
-  ];
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, 200, lines.join('\n'), {
-        fontFamily: 'monospace', fontSize: '18px', color: '#f7ffd8',
-        align: 'center', lineSpacing: 8,
-      })
-      .setOrigin(0.5, 0),
-  );
-
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, GAME_HEIGHT - 28, 'PRESS START TO GO BACK', {
-        fontFamily: 'monospace', fontSize: '12px', color: '#6f7a4a',
-      })
-      .setOrigin(0.5),
-  );
-
-  c.setVisible(false);
-}
-
-function showControlsScreen(scene) {
-  scene.startScreen.container.setVisible(false);
-  scene.controlsScreen.container.setVisible(true);
-  scene.state.phase = 'controls';
-}
-
-function showLeaderboardScreen(scene) {
-  const lines = scene.state.highScores.length
-    ? scene.state.highScores.map((e, i) =>
-        `${String(i + 1).padStart(2, '0')}  ${e.name.padEnd(3, ' ')}  ${String(e.score).padStart(3, ' ')}  ${e.winner}`,
-      )
-    : ['NO SAVED SCORES YET'];
-  scene.leaderScreen.list.setText(lines.join('\n'));
-  scene.startScreen.container.setVisible(false);
-  scene.leaderScreen.container.setVisible(true);
-  scene.state.phase = 'leaderboard';
-}
-
-function refreshStartScreenLeaderboard(scene) {
-  const lines = scene.state.highScores.length
-    ? scene.state.highScores.map((e, i) =>
-        `${String(i + 1).padStart(2, '0')} ${e.name.padEnd(3, ' ')} ${String(e.score).padStart(2, '0')} ${e.winner}`,
-      )
-    : ['NO SAVED SCORES YET'];
-  scene.startScreen.leaderboard.setText(lines.join('\n'));
-}
-
-function updateStartMenuHighlight(scene) {
-  const cursor = scene.state.menu.cursor;
-  scene.startScreen.buttons.forEach(({ bg, label }, i) => {
-    const active = i === cursor;
-    bg.setFillStyle(active ? COLORS.accent : COLORS.cell, active ? 1 : 0.95);
-    bg.setStrokeStyle(2, active ? COLORS.white : COLORS.frame, active ? 1 : 0.8);
-    label.setColor(active ? '#04110b' : '#f7ffd8');
-  });
-}
-
-function handleStartMenu(scene, time) {
-  const menu = scene.state.menu;
-  const axisY = getVerticalMenuAxis(scene.controls);
-
-  if (time >= menu.cooldown && axisY !== 0 && menu.lastAxis !== axisY) {
-    menu.cursor = Phaser.Math.Wrap(menu.cursor + axisY, 0, scene.startScreen.buttons.length);
-    menu.cooldown = time + 160;
-    updateStartMenuHighlight(scene);
-    playSound(scene, 'click');
-  }
-  if (axisY === 0) {
-    menu.lastAxis = 0;
-  } else {
-    menu.lastAxis = axisY;
-  }
-
-  if (consumeAnyPressedControl(scene, ['P1_1', 'P2_1', 'P1_2', 'P2_2', 'START1', 'START2'])) {
-    playSound(scene, 'select');
-    startAmbientMusic(scene);
-    if (menu.cursor === 0) {
-      startMatch(scene);
-    } else if (menu.cursor === 1) {
-      showLeaderboardScreen(scene);
-    } else {
-      showControlsScreen(scene);
-    }
-  }
-}
-
-function createPauseScreen(scene) {
-  scene.pauseScreen = {};
-  const c = scene.add.container(0, 0);
-  c.setDepth(25);
-  scene.pauseScreen.container = c;
-
-  c.add(scene.add.rectangle(GAME_WIDTH / 2, GAME_HEIGHT / 2, GAME_WIDTH, GAME_HEIGHT, COLORS.overlay, 0.82));
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, GAME_HEIGHT / 2 - 28, 'PAUSED', {
-        fontFamily: 'monospace', fontSize: '52px', color: '#e1ff00', fontStyle: 'bold',
-      })
-      .setOrigin(0.5),
-  );
-  c.add(
-    scene.add
-      .text(GAME_WIDTH / 2, GAME_HEIGHT / 2 + 34, 'PRESS START TO RESUME', {
-        fontFamily: 'monospace', fontSize: '16px', color: '#a8ad8a',
-      })
-      .setOrigin(0.5),
-  );
-
-  c.setVisible(false);
-}
-
-function pauseMatch(scene) {
-  scene.state.phase = 'paused';
-  scene.physics.pause();
-  scene.pauseScreen.container.setVisible(true);
-}
-
-function resumeMatch(scene) {
-  scene.pauseScreen.container.setVisible(false);
-  scene.physics.resume();
-  scene.state.phase = 'playing';
-}
-
-function returnToStart(scene) {
-  scene.state.winner = null;
-  scene.state.nameEntry.letters = [];
-  scene.endGame.container.setVisible(false);
-  refreshLeaderboard(scene);
-  showStartScreen(scene);
-}
-
-function configurePaddleBody(body) {
-  body.setImmovable(true);
-  body.allowGravity = false;
-  body.setCollideWorldBounds(false);
-}
-
-function createBall(scene, x, y, color, startingOwner) {
-  const ball = scene.add.circle(x, y, 7, color, 1);
-  scene.physics.add.existing(ball);
-
-  ball.body.setCircle(7);
-  ball.body.setBounce(1, 1);
-  ball.body.setCollideWorldBounds(false);
-  ball.body.setAllowGravity(false);
-  ball.body.setDrag(0, 0);
-  ball.body.setMaxVelocity(340, 340);
-  ball.glowColor = color;
-  ball.lastTouchedBy = startingOwner;
-  ball.ghostFor = { p1: false, p2: false };
-  ball.previousY = y;
-
-  return ball;
-}
-
-function buildTextBricks(scene) {
-  scene.playfield.bricks.clear(true, true);
-
-  // SANTIAGO in a 4×7 pixel font, centered across the cabinet playfield. Eight letters
-  // need 39 columns (4 each plus a gap): at 17 px a column they span 663 px, inside the
-  // same 680 px field the 20 px columns of shorter words used.
-  const WORD = 'SANTIAGO';
-  const CELL = 17;
-  const letters = {
-    S: ['0111', '1000', '1000', '0110', '0001', '0001', '1110'],
-    A: ['0110', '1001', '1001', '1111', '1001', '1001', '1001'],
-    N: ['1001', '1101', '1101', '1011', '1011', '1001', '1001'],
-    T: ['1111', '0110', '0110', '0110', '0110', '0110', '0110'],
-    I: ['1111', '0110', '0110', '0110', '0110', '0110', '1111'],
-    G: ['0111', '1000', '1000', '1011', '1001', '1001', '0111'],
-    O: ['0110', '1001', '1001', '1001', '1001', '1001', '0110'],
-  };
-  const columns = WORD.length * 5 - 1;
-  const left = GAME_WIDTH / 2 - (columns * CELL) / 2 + CELL / 2;
-  const brickData = [];
-  for (let letter = 0; letter < WORD.length; letter++) {
-    const pixels = letters[WORD[letter]];
-    for (let row = 0; row < 7; row++) {
-      for (let col = 0; col < 4; col++) {
-        if (pixels[row][col] === '1') {
-          brickData.push([left + (letter * 5 + col) * CELL, 257 + row * 12, (letter + row + col) % 4]);
-        }
-      }
-    }
-  }
-
-  const colors = [COLORS.brickA, COLORS.brickB, COLORS.brickC, COLORS.brickD];
-
-  for (const [bx, by, ci] of brickData) {
-    const brick = scene.add.rectangle(bx, by, CELL - 2, 10, colors[ci], 1);
-    brick.setStrokeStyle(1, COLORS.cell, 0.7);
-    scene.physics.add.existing(brick, true);
-    scene.playfield.bricks.add(brick);
-  }
-
-  scene.state.remainingBricks = scene.playfield.bricks.countActive(true);
-}
-
-function resetBalls(scene) {
-  const [topBall, bottomBall] = scene.playfield.balls;
-
-  topBall.setPosition(GAME_WIDTH / 2 - 110, 170);
-  bottomBall.setPosition(GAME_WIDTH / 2 + 110, GAME_HEIGHT - 170);
-
-  topBall.lastTouchedBy = 'p1';
-  bottomBall.lastTouchedBy = 'p2';
-  topBall.ghostFor = { p1: false, p2: false };
-  bottomBall.ghostFor = { p1: false, p2: false };
-  topBall.previousY = topBall.y;
-  bottomBall.previousY = bottomBall.y;
-  topBall.setAlpha(1);
-  bottomBall.setAlpha(1);
-
-  topBall.body.setVelocity(190, 210);
-  bottomBall.body.setVelocity(-190, -210);
-}
-
-function updatePaddles(scene, delta, time) {
-  const paddleSpeed = 320;
-  const dashSpeed = 1500;
-  const dashDuration = 110;
-  const dashCooldown = 750;
-  const p1Body = scene.playfield.p1Paddle.body;
-  const p2Body = scene.playfield.p2Paddle.body;
-  const deltaSeconds = delta / 1000;
-
-  let p1Dir = 0;
-  if (isControlHeld(scene, 'P1_L')) p1Dir -= 1;
-  if (isControlHeld(scene, 'P1_R')) p1Dir += 1;
-
-  let p2Dir = 0;
-  if (isControlHeld(scene, 'P2_L')) p2Dir -= 1;
-  if (isControlHeld(scene, 'P2_R')) p2Dir += 1;
-
-  tryStartDash(scene, 'p1', 'P1_1', p1Dir, time, dashDuration, dashCooldown);
-  tryStartDash(scene, 'p2', 'P2_1', p2Dir, time, dashDuration, dashCooldown);
-
-  let p1Velocity = p1Dir * paddleSpeed;
-  let p2Velocity = p2Dir * paddleSpeed;
-
-  if (time < scene.state.dash.p1.activeUntil) {
-    p1Velocity = scene.state.dash.p1.dir * dashSpeed;
-  }
-  if (time < scene.state.dash.p2.activeUntil) {
-    p2Velocity = scene.state.dash.p2.dir * dashSpeed;
-  }
-
-  p1Body.setVelocityX(0);
-  p2Body.setVelocityX(0);
-
-  scene.playfield.p1Paddle.setX(
-    Phaser.Math.Clamp(
-      scene.playfield.p1Paddle.x + p1Velocity * deltaSeconds,
-      110,
-      GAME_WIDTH - 110,
-    ),
-  );
-  scene.playfield.p2Paddle.setX(
-    Phaser.Math.Clamp(
-      scene.playfield.p2Paddle.x + p2Velocity * deltaSeconds,
-      110,
-      GAME_WIDTH - 110,
-    ),
-  );
-
-  if (typeof p1Body.updateFromGameObject === 'function') {
-    p1Body.updateFromGameObject();
-  }
-  if (typeof p2Body.updateFromGameObject === 'function') {
-    p2Body.updateFromGameObject();
-  }
-}
-
-function tryStartDash(scene, playerKey, buttonCode, dir, time, duration, cooldown) {
-  if (!scene.controls.pressed[buttonCode]) return;
-  scene.controls.pressed[buttonCode] = false;
-  if (dir === 0) return;
-  const dashState = scene.state.dash[playerKey];
-  if (time < dashState.cooldownUntil) return;
-  dashState.dir = dir;
-  dashState.activeUntil = time + duration;
-  dashState.cooldownUntil = time + cooldown;
-  playSound(scene, 'dash');
-  spawnDashTrail(scene, playerKey, dir);
-}
-
-function spawnDashTrail(scene, playerKey, dir) {
-  const paddle =
-    playerKey === 'p1' ? scene.playfield.p1Paddle : scene.playfield.p2Paddle;
-  const color = playerKey === 'p1' ? COLORS.p1 : COLORS.p2;
-  const trail = scene.add.rectangle(paddle.x, paddle.y, paddle.width, paddle.height, color, 0.6);
-  scene.tweens.add({
-    targets: trail,
-    x: paddle.x - dir * 50,
-    alpha: 0,
-    scaleX: 0.4,
-    duration: 260,
-    onComplete: () => trail.destroy(),
-  });
-}
-
-function updateBallGhostStates(scene) {
-  const topLine = scene.playfield.p1Paddle.y;
-  const bottomLine = scene.playfield.p2Paddle.y;
-
-  for (const ball of scene.playfield.balls) {
-    const previousY = typeof ball.previousY === 'number' ? ball.previousY : ball.y;
-    const currentY = ball.y;
-
-    if (!ball.ghostFor.p1 && previousY >= topLine && currentY < topLine) {
-      ball.ghostFor.p1 = true;
-      animatePenaltyCounter(scene, 'p1');
-      playSound(scene, 'penalty');
-    } else if (ball.ghostFor.p1 && previousY <= topLine && currentY > topLine) {
-      ball.ghostFor.p1 = false;
-    }
-
-    if (!ball.ghostFor.p2 && previousY <= bottomLine && currentY > bottomLine) {
-      ball.ghostFor.p2 = true;
-      animatePenaltyCounter(scene, 'p2');
-      playSound(scene, 'penalty');
-    } else if (
-      ball.ghostFor.p2 &&
-      previousY >= bottomLine &&
-      currentY < bottomLine
-    ) {
-      ball.ghostFor.p2 = false;
-    }
-
-    ball.setAlpha(ball.ghostFor.p1 || ball.ghostFor.p2 ? 0.45 : 1);
-    ball.previousY = currentY;
-  }
-}
-
-function checkBallEscape(scene) {
-  for (const ball of scene.playfield.balls) {
-    const escaped =
-      !isFinite(ball.x) || !isFinite(ball.y) ||
-      ball.x < 10 || ball.x > GAME_WIDTH - 10 ||
-      ball.y < 10 || ball.y > GAME_HEIGHT - 10;
-    if (!escaped) {
-      continue;
-    }
-    // Ball slipped out — respawn it near centre heading toward the field
-    const vy = ball.lastTouchedBy === 'p1' ? 220 : -220;
-    const vx = Phaser.Math.Between(-160, 160);
-    ball.setPosition(GAME_WIDTH / 2, GAME_HEIGHT / 2);
-    ball.ghostFor = { p1: false, p2: false };
-    ball.previousY = GAME_HEIGHT / 2;
-    ball.setAlpha(1);
-    ball.body.setVelocity(vx, vy);
-  }
-}
-
-function canBallCollideWithPaddle(ball, playerKey) {
-  return ball.active && !ball.ghostFor?.[playerKey];
-}
-
-function updateBallTrails(scene, time) {
-  if (time % 3 > 1) {
-    return;
-  }
-
-  for (const ball of scene.playfield.balls) {
-    const trail = scene.add.circle(ball.x, ball.y, 4, ball.glowColor, 0.2);
-    scene.playfield.ballTrails.add(trail);
-
-    scene.tweens.add({
-      targets: trail,
-      alpha: 0,
-      scaleX: 0.2,
-      scaleY: 0.2,
-      duration: 250,
-      onComplete: () => trail.destroy(),
-    });
-  }
-}
-
-function handleBallPaddleCollision(scene, ball, paddle, playerKey) {
-  ball.lastTouchedBy = playerKey;
-  const ballColor = playerKey === 'p1' ? COLORS.p1 : COLORS.p2;
-  ball.setFillStyle(ballColor);
-  ball.glowColor = ballColor;
-
-  const offset = (ball.x - paddle.x) / (paddle.width / 2);
-  const currentSpeed = Math.min(ball.body.velocity.length() + 8, 330);
-  const horizontalVelocity = Phaser.Math.Clamp(offset * 220, -220, 220);
-  const verticalDirection = paddle === scene.playfield.p1Paddle ? 1 : -1;
-  const verticalVelocity = Math.max(120, Math.sqrt(currentSpeed * currentSpeed - horizontalVelocity * horizontalVelocity));
-
-  ball.body.setVelocity(horizontalVelocity, verticalVelocity * verticalDirection);
-}
-
-function handleBallBrickCollision(scene, ball, brick) {
-  if (!brick.active) {
-    return;
-  }
-
-  const brickX = brick.x;
-  const brickY = brick.y;
-  const brickHalfWidth = brick.width / 2;
-  const brickHalfHeight = brick.height / 2;
-  const deltaX = ball.x - brickX;
-  const deltaY = ball.y - brickY;
-  const normalizedX = Math.abs(deltaX) / Math.max(brickHalfWidth, 1);
-  const normalizedY = Math.abs(deltaY) / Math.max(brickHalfHeight, 1);
-  const speedX = Math.abs(ball.body.velocity.x);
-  const speedY = Math.abs(ball.body.velocity.y);
-
-  if (normalizedX > normalizedY) {
-    ball.body.setVelocityX((deltaX >= 0 ? 1 : -1) * Math.max(speedX, 150));
-    ball.setX(
-      brickX +
-        (deltaX >= 0 ? 1 : -1) * (brickHalfWidth + ball.width / 2 + 1),
-    );
-  } else {
-    ball.body.setVelocityY((deltaY >= 0 ? 1 : -1) * Math.max(speedY, 150));
-    ball.setY(
-      brickY +
-        (deltaY >= 0 ? 1 : -1) * (brickHalfHeight + ball.height / 2 + 1),
-    );
-  }
-
-  if (typeof ball.body.updateFromGameObject === 'function') {
-    ball.body.updateFromGameObject();
-  }
-
-  if (brick.body) {
-    brick.body.enable = false;
-  }
-  scene.playfield.bricks.remove(brick);
-  brick.destroy();
-  scene.state.remainingBricks -= 1;
-
-  if (ball.lastTouchedBy === 'p1') {
-    scene.state.scores.p1 += 1;
-  } else if (ball.lastTouchedBy === 'p2') {
-    scene.state.scores.p2 += 1;
-  }
-
-  spawnBrickBurst(scene, brick.x, brick.y, brick.fillColor);
-  playSound(scene, 'brick');
-  refreshHud(scene);
-  maybeFinishMatch(scene);
-}
-
-function startAmbientMusic(scene) {
-  if (scene.state.musicStarted) {
-    return;
-  }
-  scene.state.musicStarted = true;
-
-  try {
-    const ctx = scene.sound.context;
-    if (!ctx) {
-      return;
-    }
-
-    // Master output
-    const out = ctx.createGain();
-    out.gain.value = 0.18;
-    out.connect(ctx.destination);
-
-    // Feedback delay for space/depth
-    const dly  = ctx.createDelay(2);
-    const dlFb = ctx.createGain();
-    dly.delayTime.value = 0.48;
-    dlFb.gain.value = 0.28;
-    dly.connect(dlFb);
-    dlFb.connect(dly);
-    dlFb.connect(out);
-
-    // Pad — Am7 chord (A2 C3 E3 G3) through chorused detuned oscs + LP filter
-    const padFilt = ctx.createBiquadFilter();
-    padFilt.type = 'lowpass';
-    padFilt.frequency.value = 800;
-    padFilt.Q.value = 1.4;
-    padFilt.connect(out);
-    padFilt.connect(dly);
-
-    // Very slow LFO sweeps the filter cutoff for movement
-    const lfo  = ctx.createOscillator();
-    const lfoG = ctx.createGain();
-    lfo.frequency.value = 0.055;
-    lfoG.gain.value = 430;
-    lfo.connect(lfoG);
-    lfoG.connect(padFilt.frequency);
-    lfo.start();
-
-    [
-      [110, 0, 'sawtooth'], [110, 11, 'sawtooth'], [110, -11, 'sawtooth'],
-      [130.81, 0, 'triangle'], [164.81, 5, 'triangle'], [196, -4, 'triangle'],
-    ].forEach(([f, d, type]) => {
-      const osc = ctx.createOscillator();
-      const g   = ctx.createGain();
-      osc.type = type;
-      osc.frequency.value = f;
-      osc.detune.value = d;
-      g.gain.value = 0.028;
-      osc.connect(g);
-      g.connect(padFilt);
-      osc.start();
-    });
-
-    // Arp — A minor pentatonic, up and back down
-    const ARP  = [220, 261.63, 293.66, 329.63, 392, 440, 392, 329.63, 293.66, 261.63];
-    const STEP = 0.43;
-    const ALEN = ARP.length * STEP;
-
-    function scheduleArp(t0) {
-      ARP.forEach((freq, i) => {
-        const t   = t0 + i * STEP;
-        const osc = ctx.createOscillator();
-        const g   = ctx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.value = freq;
-        osc.connect(g);
-        g.connect(out);
-        g.connect(dly);
-        g.gain.setValueAtTime(0.001, t);
-        g.gain.linearRampToValueAtTime(0.048, t + 0.018);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + STEP * 0.65);
-        osc.start(t);
-        osc.stop(t + STEP * 0.72);
-      });
-      scene.time.delayedCall((ALEN - 0.06) * 1000, () => scheduleArp(t0 + ALEN));
-    }
-
-    // Sub-bass pulse on the beat (55 Hz sine, 120 bpm)
-    const BEAT = 1.0;
-    function scheduleBass(t) {
-      const osc = ctx.createOscillator();
-      const g   = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = 55;
-      osc.connect(g);
-      g.connect(out);
-      g.gain.setValueAtTime(0.28, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
-      osc.start(t);
-      osc.stop(t + 0.55);
-      scene.time.delayedCall(BEAT * 1000, () => scheduleBass(t + BEAT));
-    }
-
-    // Short high-pitched digital tick — every half-beat, offset for syncopation
-    const TICK = 0.5;
-    function scheduleTick(t) {
-      const osc = ctx.createOscillator();
-      const g   = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = 1320;
-      osc.connect(g);
-      g.connect(out);
-      g.gain.setValueAtTime(0.028, t);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.02);
-      osc.start(t);
-      osc.stop(t + 0.025);
-      scene.time.delayedCall(TICK * 1000, () => scheduleTick(t + TICK));
-    }
-
-    const t0 = ctx.currentTime + 0.3;
-    scheduleArp(t0);
-    scheduleBass(t0);
-    scheduleTick(t0 + 0.25);
-  } catch (_) {}
-}
-
-function playSound(scene, type) {
-  try {
-    const ctx = scene.sound && scene.sound.context ? scene.sound.context : new AudioContext();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-
-    const now = ctx.currentTime;
-    if (type === 'brick') {
-      osc.type = 'square';
-      osc.frequency.setValueAtTime(880, now);
-      osc.frequency.exponentialRampToValueAtTime(440, now + 0.08);
-      gain.gain.setValueAtTime(0.18, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
-      osc.start(now);
-      osc.stop(now + 0.1);
-    } else if (type === 'penalty') {
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(300, now);
-      osc.frequency.exponentialRampToValueAtTime(80, now + 0.35);
-      gain.gain.setValueAtTime(0.28, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.38);
-      osc.start(now);
-      osc.stop(now + 0.38);
-    } else if (type === 'click') {
-      osc.type = 'square';
-      osc.frequency.setValueAtTime(1200, now);
-      osc.frequency.exponentialRampToValueAtTime(600, now + 0.04);
-      gain.gain.setValueAtTime(0.08, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
-      osc.start(now);
-      osc.stop(now + 0.05);
-    } else if (type === 'dash') {
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(180, now);
-      osc.frequency.exponentialRampToValueAtTime(900, now + 0.12);
-      gain.gain.setValueAtTime(0.22, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-      osc.start(now);
-      osc.stop(now + 0.18);
-    } else if (type === 'select') {
-      osc.type = 'square';
-      osc.frequency.setValueAtTime(700, now);
-      osc.frequency.exponentialRampToValueAtTime(1400, now + 0.08);
-      gain.gain.setValueAtTime(0.12, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
-      osc.start(now);
-      osc.stop(now + 0.1);
-    }
-  } catch (_) {}
-}
-
-function spawnBrickBurst(scene, x, y, color) {
-  for (let index = 0; index < 6; index += 1) {
-    const particle = scene.add.rectangle(x, y, 4, 4, color, 1);
-    const angle = Phaser.Math.FloatBetween(0, Math.PI * 2);
-    const distance = Phaser.Math.Between(16, 42);
-
-    scene.tweens.add({
-      targets: particle,
-      x: x + Math.cos(angle) * distance,
-      y: y + Math.sin(angle) * distance,
-      alpha: 0,
-      angle: Phaser.Math.Between(-90, 90),
-      duration: Phaser.Math.Between(180, 320),
-      onComplete: () => particle.destroy(),
-    });
-  }
-}
-
-function refreshHud(scene) {
-  scene.hud.p1Score.setText(`P1 ${String(scene.state.scores.p1).padStart(2, '0')}`);
-  scene.hud.p2Score.setText(`P2 ${String(scene.state.scores.p2).padStart(2, '0')}`);
-  scene.hud.remaining.setText(`BRICKS ${String(scene.state.remainingBricks).padStart(3, '0')}`);
-}
-
-function animatePenaltyCounter(scene, playerKey) {
-  const text =
-    playerKey === 'p1' ? scene.hud.p1Score : scene.hud.p2Score;
-  const baseColor =
-    playerKey === 'p1'
-      ? scene.hud.scoreColors.p1
-      : scene.hud.scoreColors.p2;
-
-  scene.tweens.killTweensOf(text);
-  text.setColor(scene.hud.scoreColors.penalty);
-  text.setScale(1);
-  text.setAngle(0);
-
-  scene.tweens.add({
-    targets: text,
-    scaleX: 1.12,
-    scaleY: 1.12,
-    angle: playerKey === 'p1' ? -6 : 6,
-    duration: 90,
-    yoyo: true,
-    repeat: 1,
-    onComplete: () => {
-      text.setColor(baseColor);
-      text.setScale(1);
-      text.setAngle(0);
-    },
-  });
-}
-
-function maybeFinishMatch(scene) {
-  const { p1, p2 } = scene.state.scores;
-  const remaining = scene.state.remainingBricks;
-  const leaderScore = Math.max(p1, p2);
-  const trailingScore = Math.min(p1, p2);
-
-  if (remaining === 0 || leaderScore >= trailingScore + remaining) {
-    finishMatch(scene);
-  }
-}
-
-function finishMatch(scene) {
-  if (scene.state.phase !== 'playing') {
-    return;
-  }
-
-  scene.state.phase = 'gameover';
-  scene.physics.pause();
-  scene.hud.status.setText('');
-
-  const p1 = scene.state.scores.p1;
-  const p2 = scene.state.scores.p2;
-  const isTie = p1 === p2;
-
-  scene.state.winner = isTie ? 'draw' : p1 > p2 ? 'p1' : 'p2';
-  scene.state.winnerLabel =
-    scene.state.winner === 'p1'
-      ? 'PLAYER 1'
-      : scene.state.winner === 'p2'
-        ? 'PLAYER 2'
-        : 'DRAW';
-
-  scene.endGame.container.setVisible(true);
-  scene.endGame.summary.setText(
-    isTie
-      ? `${p1}  :  ${p2}`
-      : `${scene.state.winnerLabel}  ${Math.max(p1, p2)}  :  ${Math.min(p1, p2)}`,
-  );
-  scene.endGame.nameLabel.setText(
-    isTie ? 'DRAW TAG' : 'INITIALS',
-  );
-  scene.endGame.saveStatus.setText(scene.state.saveStatus);
-
-  scene.state.nameEntry.row = 0;
-  scene.state.nameEntry.col = 0;
-  scene.state.nameEntry.moveCooldownUntil = 0;
-  scene.state.nameEntry.confirmCooldownUntil = 0;
-  scene.state.nameEntry.lastMoveVector = { x: 0, y: 0 };
-  refreshNameEntry(scene);
-  updateLetterGridHighlight(scene);
-}
-
-function handleNameEntry(scene, time) {
-  const axisX = getHorizontalMenuAxis(scene.controls);
-  const axisY = getVerticalMenuAxis(scene.controls);
-  const entry = scene.state.nameEntry;
-
-  if (
-    time >= entry.moveCooldownUntil &&
-    (axisX !== 0 || axisY !== 0) &&
-    (entry.lastMoveVector.x !== axisX || entry.lastMoveVector.y !== axisY)
-  ) {
-    moveLetterSelection(scene, axisX, axisY);
-    entry.moveCooldownUntil = time + 160;
-    playSound(scene, 'click');
-  }
-
-  if (axisX === 0 && axisY === 0) {
-    entry.lastMoveVector = { x: 0, y: 0 };
-  } else {
-    entry.lastMoveVector = { x: axisX, y: axisY };
-  }
-
-  if (
-    time >= entry.confirmCooldownUntil &&
-    consumeAnyPressedControl(scene, ['P1_1', 'P2_1', 'P1_2', 'P2_2', 'START1', 'START2'])
-  ) {
-    entry.confirmCooldownUntil = time + 180;
-    playSound(scene, 'select');
-    activateCurrentLetter(scene);
-  }
-}
-
-function getHorizontalMenuAxis(controls) {
-  let axis = 0;
-  if (controls.held.P1_L || controls.held.P2_L) {
-    axis -= 1;
-  }
-  if (controls.held.P1_R || controls.held.P2_R) {
-    axis += 1;
-  }
-  return Phaser.Math.Clamp(axis, -1, 1);
-}
-
-function getVerticalMenuAxis(controls) {
-  let axis = 0;
-  if (controls.held.P1_U || controls.held.P2_U) {
-    axis -= 1;
-  }
-  if (controls.held.P1_D || controls.held.P2_D) {
-    axis += 1;
-  }
-  return Phaser.Math.Clamp(axis, -1, 1);
-}
-
-function normalizeIncomingKey(key) {
-  if (typeof key !== 'string' || key.length === 0) {
-    return '';
-  }
-
-  if (key === ' ') {
-    return 'space';
-  }
-
-  return key.toLowerCase();
-}
-
-function isControlHeld(scene, controlCode) {
-  return scene.controls.held[controlCode] === true;
-}
-
-function consumeAnyPressedControl(scene, controlCodes) {
-  for (const controlCode of controlCodes) {
-    if (scene.controls.pressed[controlCode]) {
-      scene.controls.pressed[controlCode] = false;
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function moveLetterSelection(scene, axisX, axisY) {
-  const entry = scene.state.nameEntry;
-
-  if (axisY !== 0) {
-    entry.row = Phaser.Math.Wrap(entry.row + axisY, 0, LETTER_GRID.length);
-    entry.col = Math.min(entry.col, LETTER_GRID[entry.row].length - 1);
-  }
-
-  if (axisX !== 0) {
-    entry.col = Phaser.Math.Wrap(entry.col + axisX, 0, LETTER_GRID[entry.row].length);
-  }
-
-  updateLetterGridHighlight(scene);
-}
-
-function updateLetterGridHighlight(scene) {
-  const entry = scene.state.nameEntry;
-  for (const item of scene.endGame.gridLabels) {
-    const active = item.row === entry.row && item.col === entry.col;
-    item.cell.setFillStyle(active ? COLORS.accent : COLORS.cell, active ? 1 : 0.95);
-    item.cell.setStrokeStyle(2, active ? COLORS.white : COLORS.frame, active ? 1 : 0.8);
-    item.label.setColor(active ? '#04110b' : '#f7ffd8');
-  }
-}
-
-function activateCurrentLetter(scene) {
-  const entry = scene.state.nameEntry;
-  const selectedValue = LETTER_GRID[entry.row][entry.col];
-
-  if (selectedValue === 'DEL') {
-    entry.letters.pop();
-    refreshNameEntry(scene);
-    return;
-  }
-
-  if (selectedValue === 'END') {
-    if (entry.letters.length === 0) {
-      scene.endGame.saveStatus.setText('Pick at least one character before saving.');
-      return;
-    }
-
-    submitHighScore(scene);
-    return;
-  }
-
-  if (entry.letters.length >= WINNING_NAME_LENGTH) {
-    entry.letters.shift();
-  }
-
-  entry.letters.push(selectedValue);
-  refreshNameEntry(scene);
-}
-
-function refreshNameEntry(scene) {
-  const letters = scene.state.nameEntry.letters.slice();
-  while (letters.length < WINNING_NAME_LENGTH) {
-    letters.push('_');
-  }
-  scene.endGame.nameValue.setText(letters.join(' '));
-}
-
-function submitHighScore(scene) {
-  if (scene.state.phase !== 'gameover') {
-    return;
-  }
-
-  const initials = scene.state.nameEntry.letters.join('').slice(0, WINNING_NAME_LENGTH) || '???';
-  const winningScore =
-    scene.state.winner === 'p1'
-      ? scene.state.scores.p1
-      : scene.state.winner === 'p2'
-        ? scene.state.scores.p2
-        : scene.state.scores.p1;
-
-  const entry = {
-    name: initials,
-    winner: scene.state.winnerLabel,
-    score: winningScore,
-    detail: `${scene.state.scores.p1}-${scene.state.scores.p2}`,
-    savedAt: new Date().toISOString().slice(0, 10),
-  };
-
-  scene.state.saveStatus = `Saved ${initials}! Press START to play again.`;
-  scene.endGame.saveStatus.setText(scene.state.saveStatus);
-  scene.state.phase = 'saved';
-
-  persistHighScore(entry)
-    .then((nextScores) => {
-      scene.state.highScores = nextScores;
-      refreshLeaderboard(scene);
-    })
-    .catch(() => {
-      scene.state.saveStatus = 'Could not save the score, but the game result stands.';
-      if (scene.state.phase === 'saved') {
-        scene.endGame.saveStatus.setText(scene.state.saveStatus);
-      }
-    });
-}
-
-function refreshLeaderboard(scene) {
-  const lines = scene.state.highScores.length
-    ? scene.state.highScores.map((entry, index) => {
-        const rank = String(index + 1).padStart(2, '0');
-        const score = String(entry.score).padStart(2, '0');
-        return `${rank} ${entry.name.padEnd(3, ' ')} ${score} ${entry.winner}`;
-      })
-    : ['NO SAVED SCORES YET'];
-
-  scene.endGame.leaderboard.setText(lines.join('\n'));
-}
-
-async function persistHighScore(entry) {
-  const existing = await loadHighScores();
-  const nextScores = existing
-    .concat(entry)
-    .sort((left, right) => {
-      if (right.score !== left.score) {
-        return right.score - left.score;
-      }
-      return left.savedAt < right.savedAt ? 1 : -1;
-    })
-    .slice(0, MAX_HIGH_SCORES);
-
-  await storageSet(STORAGE_KEY, nextScores);
-  return nextScores;
-}
-
-async function loadHighScores() {
-  const result = await storageGet(STORAGE_KEY);
-  if (!result.found || !Array.isArray(result.value)) {
-    return [];
-  }
-
-  return result.value.filter(isHighScoreEntry).slice(0, MAX_HIGH_SCORES);
-}
-
-function isHighScoreEntry(value) {
-  return (
-    value &&
-    typeof value === 'object' &&
-    typeof value.name === 'string' &&
-    typeof value.winner === 'string' &&
-    typeof value.score === 'number' &&
-    typeof value.detail === 'string' &&
-    typeof value.savedAt === 'string'
-  );
-}
-
+const NODES = {
+  LH: { x: 250, y: 320, name: 'LOS HÉROES', keys: ['L', '1'], btn: '1', tx: -10, ty: -30, ta: 1, bx: 34, by: 38, dir: 180 },
+  SA: { x: 400, y: 170, name: 'SANTA ANA', keys: ['U', 'D', '2'], btn: '2', tx: -12, ty: -30, ta: 1, bx: 0, by: 46, dir: -90 },
+  BQ: { x: 550, y: 320, name: 'BAQUEDANO', keys: ['R', '3'], btn: '3', tx: 12, ty: -30, ta: 0, bx: -34, by: 38, dir: 0 },
+  FR: { x: 190, y: 470, name: 'FRANKLIN', keys: ['4'], btn: '4', tx: 12, ty: -30, ta: 0, bx: 30, by: 36 },
+  NU: { x: 610, y: 470, name: 'ÑUBLE', keys: ['5'], btn: '5', tx: 12, ty: -30, ta: 0, bx: -30, by: 36 },
+  TB: { x: 680, y: 320, name: 'TOBALABA', keys: ['6'], btn: '6', tx: 12, ty: -30, ta: 0, bx: -30, by: 36 },
+};
+
+const EDGES = [
+  // Línea 1 (red): west -> east
+  { line: 'L1', from: null, to: 'LH', pts: [[-30, 400], [90, 400], [170, 320], [250, 320]] },
+  { line: 'L1', from: 'LH', to: 'BQ', pts: [[250, 320], [550, 320]] },
+  { line: 'L1', from: 'BQ', to: 'TB', pts: [[550, 320], [680, 320]] },
+  { line: 'L1', from: 'TB', to: null, pts: [[680, 320], [770, 320]] },
+  // Línea 2 (yellow): north -> south
+  { line: 'L2', from: null, to: 'SA', pts: [[830, 90], [480, 90], [400, 170]] },
+  { line: 'L2', from: 'SA', to: 'LH', pts: [[400, 170], [250, 320]] },
+  { line: 'L2', from: 'LH', to: 'FR', pts: [[250, 320], [190, 380], [190, 470]] },
+  { line: 'L2', from: 'FR', to: null, pts: [[190, 470], [190, 560]] },
+  // Línea 5 (green): west -> south-east
+  { line: 'L5', from: null, to: 'SA', pts: [[-30, 170], [400, 170]] },
+  { line: 'L5', from: 'SA', to: 'BQ', pts: [[400, 170], [550, 320]] },
+  { line: 'L5', from: 'BQ', to: 'NU', pts: [[550, 320], [610, 380], [610, 470]] },
+  { line: 'L5', from: 'NU', to: null, pts: [[610, 470], [610, 560]] },
+  // Línea 6 (purple): west -> east along the south
+  { line: 'L6', from: null, to: 'FR', pts: [[-30, 470], [190, 470]] },
+  { line: 'L6', from: 'FR', to: 'NU', pts: [[190, 470], [610, 470]] },
+  { line: 'L6', from: 'NU', to: null, pts: [[610, 470], [740, 470]] },
+  // Línea 4 (blue): north-east -> south-east
+  { line: 'L4', from: null, to: 'TB', pts: [[830, 190], [740, 190], [680, 250], [680, 320]] },
+  { line: 'L4', from: 'TB', to: null, pts: [[680, 320], [680, 360], [720, 400], [770, 400]] },
+];
+
+const BASS = [110, 0, 110, 0, 165, 0, 110, 131, 110, 0, 110, 0, 196, 0, 165, 147];
+const hex = (c) => '#' + c.toString(16).padStart(6, '0');
+const pad6 = (n) => String(n).padStart(6, '0');
+const rnd = Math.random;
+const pick = (a) => a[Math.floor(rnd() * a.length)];
+// Blend two 0xRRGGBB colours (k = 0 gives a, k = 1 gives b).
+const mix = (a, b, k) => {
+  const f = (s) => Math.round(((a >> s) & 255) + (((b >> s) & 255) - ((a >> s) & 255)) * k);
+  return (f(16) << 16) | (f(8) << 8) | f(0);
+};
+
+// Leaderboard storage: the arcade bridge when present, localStorage when
+// testing locally, and silently nothing if neither is available.
 function getStorage() {
-  if (window.platanusArcadeStorage) {
-    return window.platanusArcadeStorage;
-  }
-
+  const st = window.platanusArcadeStorage;
   return {
     async get(key) {
+      if (st) return st.get(key);
       try {
         const raw = window.localStorage.getItem(key);
-        return raw === null
-          ? { found: false, value: null }
-          : { found: true, value: JSON.parse(raw) };
-      } catch {
+        return raw === null ? { found: false, value: null } : { found: true, value: JSON.parse(raw) };
+      } catch (err) {
         return { found: false, value: null };
       }
     },
     async set(key, value) {
-      window.localStorage.setItem(key, JSON.stringify(value));
+      if (st) return st.set(key, value);
+      try {
+        window.localStorage.setItem(key, JSON.stringify(value));
+      } catch (err) {
+        /* no storage: the board stays in memory */
+      }
     },
-};
+  };
 }
 
-async function storageGet(key) {
-  return getStorage().get(key);
+class HoraPunta extends Phaser.Scene {
+  constructor() {
+    super('main');
+  }
+
+  // No external assets: train sprites are drawn once into textures here.
+  preload() {
+    for (const [id, line] of Object.entries(LINES)) {
+      for (let ex = 0; ex < 2; ex++) {
+        const w = ex ? 34 : 26;
+        const h = 14;
+        const p = 10;
+        const g = this.make.graphics({ add: false });
+        for (let i = 4; i > 0; i--) {
+          g.fillStyle(line.color, 0.09);
+          g.fillRoundedRect(p - i * 2, p - i * 2, w + i * 4, h + i * 4, 4 + i * 2);
+        }
+        g.fillStyle(BG, 1);
+        g.fillRoundedRect(p - 2, p - 2, w + 4, h + 4, 5);
+        g.fillStyle(line.color, 1);
+        g.fillRoundedRect(p, p, w, h, 3);
+        g.fillStyle(0xffffff, 1);
+        g.fillRect(p + w - 5, p + 3, 3, h - 6); // headlight
+        if (ex) g.fillRect(p + 4, p + 5, w - 12, 4); // express: white-hot stripe
+        g.generateTexture('t' + id + ex, w + p * 2, h + p * 2);
+        g.destroy();
+      }
+    }
+  }
+
+  create() {
+    this.trains = [];
+    this.scores = [];
+    this.mode = 'boot';
+    this.now = 0; // ms of simulated time (stops while paused)
+    this.sm = 1; // smoothed speed multiplier (2 during rush hour)
+    this.score = 0;
+    this.comboMultiplier = 1; // "Racha de Pasajeros": x1..x5
+    this.consecutiveTrains = 0; // progress toward the next multiplier tier
+    this.lives = START_LIVES;
+    this.t = 0;
+    // phase: calm -> rush -> clear -> bonus -> reward -> inaug -> calm ...
+    this.phase = 'calm';
+    this.ph = 0; // phase timer (seconds)
+    this.cyc = 0; // seconds into the current calm/rush period
+    this.rush = false;
+    this.spawnT = 500;
+    this.demoT = 0;
+    this.beat = 0;
+    this.beatT = 0;
+    this.blink = null;
+    this.v1 = new Phaser.Math.Vector2();
+    this.v2 = new Phaser.Math.Vector2();
+
+    this.buildMap();
+    this.buildHud();
+    this.ui = this.add.container(0, 0).setDepth(30);
+    this.bindInput();
+    this.loadScores();
+    this.showTitle();
+  }
+
+  // ---------------------------------------------------------------- map ---
+  buildMap() {
+    const dots = this.add.graphics();
+    dots.fillStyle(0x161b28, 1);
+    for (let x = 20; x < W; x += 40) for (let y = 60; y < H; y += 40) dots.fillRect(x, y, 2, 2);
+    this.rushBg = this.add.rectangle(W / 2, H / 2, W, H, 0xff1f4b).setAlpha(0);
+
+    // Runtime copy of every line: on = inaugurated, k = 0 (grey) .. 1 (neon).
+    this.lines = {};
+    this.lineList = [];
+    for (const [id, d] of Object.entries(LINES)) {
+      const L = Object.assign({ id, on: false, k: 0, edges: [] }, d);
+      L.glow = this.add.graphics().setBlendMode(Phaser.BlendModes.ADD);
+      L.g = this.add.graphics();
+      this.lines[id] = L;
+      this.lineList.push(L);
+    }
+
+    this.nodes = {};
+    this.nodeList = [];
+    for (const [id, d] of Object.entries(NODES)) {
+      const n = Object.assign({ id, state: 0, active: false, ins: [], outs: [], lines: [], objs: [], last: -1e9 }, d);
+      this.nodes[id] = n;
+      this.nodeList.push(n);
+    }
+
+    const unit = (a, b) => {
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const l = Math.hypot(dx, dy) || 1;
+      return { x: dx / l, y: dy / l };
+    };
+
+    this.entries = [];
+    for (const d of EDGES) {
+      const p = d.pts;
+      const L = this.lines[d.line];
+      // Each edge is a Phaser path; trains follow it with path.getPoint().
+      const path = new Phaser.Curves.Path(p[0][0], p[0][1]);
+      for (let i = 1; i < p.length; i++) path.lineTo(p[i][0], p[i][1]);
+      const e = {
+        L,
+        line: d.line,
+        color: L.color,
+        pts: p,
+        path,
+        len: path.getLength(),
+        from: this.nodes[d.from] || null,
+        to: this.nodes[d.to] || null,
+        outDir: unit(p[0], p[1]), // direction trains leave the start node
+        inDir: unit(p[p.length - 1], p[p.length - 2]), // direction trains arrive from
+        ex: p[p.length - 1][0],
+        ey: p[p.length - 1][1],
+        st: [], // small decorative stations along the edge
+      };
+      L.edges.push(e);
+      for (const n of [e.from, e.to]) if (n && !n.lines.includes(d.line)) n.lines.push(d.line);
+      if (e.from) e.from.outs.push(e);
+      else this.entries.push(e);
+      if (e.to) e.to.ins.push(e);
+
+      for (let s = 70; s < e.len - 45; s += 75) {
+        const q = path.getPoint(s / e.len, this.v1);
+        if (q && q.x > 12 && q.x < W - 12) e.st.push([q.x, q.y]);
+      }
+      if (!e.to) {
+        // Terminal badge: trains of this colour must end here.
+        e.badge = [
+          this.add.circle(e.ex, e.ey, 21, e.color, 0.18).setDepth(7),
+          this.add.circle(e.ex, e.ey, 16, e.color).setDepth(7),
+          this.add.text(e.ex, e.ey, L.label, { fontFamily: FONT, fontSize: '15px', fontStyle: 'bold', color: '#0a0c12' }).setOrigin(0.5).setDepth(7),
+        ];
+      }
+      if (!e.from) {
+        const q = path.getPoint(48 / e.len, this.v1);
+        e.sx = q.x;
+        e.sy = q.y;
+      }
+    }
+
+    for (const n of this.nodeList) {
+      n.g = this.add.graphics({ x: n.x, y: n.y }).setDepth(5);
+      const name = this.add.text(n.x + n.tx, n.y + n.ty, n.name, { fontFamily: FONT, fontSize: '13px', fontStyle: 'bold', color: '#e8ecf5' }).setOrigin(n.ta, 1).setDepth(7);
+
+      // Control hint: joystick direction (when it has one) + button number.
+      const joy = n.dir !== undefined;
+      const hw = joy ? 23 : 13;
+      const b = this.add.graphics({ x: n.x + n.bx, y: n.y + n.by }).setDepth(7);
+      b.fillStyle(0x10141f, 0.95);
+      b.fillRoundedRect(-hw, -11, hw * 2, 22, 6);
+      b.lineStyle(1, 0x55607a, 1);
+      b.strokeRoundedRect(-hw, -11, hw * 2, 22, 6);
+      if (joy) {
+        const a = Phaser.Math.DegToRad(n.dir);
+        const tri = [0, 2.3, -2.3].map((o) => [Math.cos(a + o) * 7 - 11, Math.sin(a + o) * 7]);
+        b.fillStyle(0xffffff, 1);
+        b.fillTriangle(tri[0][0], tri[0][1], tri[1][0], tri[1][1], tri[2][0], tri[2][1]);
+      }
+      const num = this.add.text(n.x + n.bx + (joy ? 11 : 0), n.y + n.by, n.btn, { fontFamily: FONT, fontSize: '15px', fontStyle: 'bold', color: '#ffe14d' }).setOrigin(0.5).setDepth(7);
+
+      // Mouse/touch works too (handy for testing; the cabinet has no mouse).
+      const zone = this.add.circle(n.x, n.y, 36, 0, 0).setInteractive({ useHandCursor: true }).on('pointerdown', () => {
+        if (this.mode === 'play') this.toggle(n);
+      });
+      n.objs = [n.g, name, b, num, zone];
+    }
+  }
+
+  // Redraws one line at its current brightness k (0 = dim grey, 1 = neon).
+  drawLine(L) {
+    const k = L.k;
+    const col = mix(GREY, L.color, k);
+    L.glow.clear().setDepth(k > 0 ? 0.9 : 0.5);
+    L.g.clear().setDepth(k > 0 ? 1 : 0.6);
+    for (const e of L.edges) {
+      if (k > 0) {
+        L.glow.lineStyle(18, L.color, 0.12 * k);
+        e.path.draw(L.glow);
+      }
+      L.g.lineStyle(6, col, 1);
+      e.path.draw(L.g);
+      L.g.fillStyle(col, 1);
+      for (const p of e.pts) L.g.fillCircle(p[0], p[1], 3);
+      for (const s of e.st) {
+        L.g.fillStyle(BG, 1);
+        L.g.fillCircle(s[0], s[1], 4.5);
+        L.g.lineStyle(2, 0xffffff, 0.2 + 0.65 * k);
+        L.g.strokeCircle(s[0], s[1], 4.5);
+      }
+      if (!e.from) {
+        L.g.fillStyle(BG, 1);
+        L.g.fillCircle(e.sx, e.sy, 7);
+        L.g.lineStyle(3, col, 1);
+        L.g.strokeCircle(e.sx, e.sy, 7);
+      }
+      if (e.badge) {
+        e.badge[0].setFillStyle(L.color, 0.18 * k);
+        e.badge[1].setFillStyle(col).setStrokeStyle(3, 0xffffff, 0.15 + 0.85 * k);
+        e.badge[2].setAlpha(0.35 + 0.65 * k);
+      }
+    }
+  }
+
+  // Opens the first `count` lines instantly (game start and attract mode).
+  openLines(count) {
+    this.lineList.forEach((L, i) => {
+      L.on = i < count;
+      L.k = L.on ? 1 : 0;
+      this.drawLine(L);
+    });
+    this.refreshNodes(false);
+  }
+
+  // A switch exists only while every line through it is open.
+  refreshNodes(pop) {
+    for (const n of this.nodeList) {
+      const act = n.lines.every((id) => this.lines[id].on && this.lines[id].k === 1);
+      const fresh = act && !n.active;
+      n.active = act;
+      if (!act) n.state = 0;
+      for (const o of n.objs) o.setVisible(act);
+      this.drawNode(n);
+      if (fresh && pop) {
+        n.g.setScale(0);
+        this.tweens.add({ targets: n.g, scale: 1, duration: 420, ease: 'Back.easeOut' });
+        this.ping(n.x, n.y, 0xffffff, 70);
+        this.tone(880, 0.12, 'triangle', 0.08);
+      }
+    }
+  }
+
+  // The switching rule. state 0: stay on your own line. state 1: take the other one.
+  // Switches that are not active yet always let trains straight through.
+  route(n, inEdge) {
+    const same = n.outs.find((o) => o.line === inEdge.line) || n.outs[0];
+    if (!n.active) return same;
+    const other = n.outs.find((o) => o !== same) || same;
+    return n.state ? other : same;
+  }
+
+  // Terminal colours a train entering edge e can still reach.
+  reach(e) {
+    const n = e.to;
+    if (!n) return [e.line];
+    const outs = n.active ? n.outs : n.outs.filter((o) => o.line === e.line);
+    return [...new Set(outs.flatMap((o) => this.reach(o)))];
+  }
+
+  // A node shows, for each incoming line, a connector in that line's colour
+  // bending toward the exit it currently feeds, ending in an arrowhead.
+  drawNode(n) {
+    const g = n.g;
+    const R = 21;
+    const V = Phaser.Math.Vector2;
+    g.clear();
+    g.fillStyle(0x0a0c12, 1);
+    g.fillCircle(0, 0, R + 2);
+    for (const e of n.ins) {
+      const o = this.route(n, e);
+      const ux = o.outDir.x;
+      const uy = o.outDir.y;
+      g.fillStyle(0x0a0c12, 1);
+      g.fillTriangle(ux * (R + 23), uy * (R + 23), ux * (R + 1) - uy * 12, uy * (R + 1) + ux * 12, ux * (R + 1) + uy * 12, uy * (R + 1) - ux * 12);
+      g.fillStyle(e.color, 1);
+      g.fillTriangle(ux * (R + 18), uy * (R + 18), ux * (R + 4) - uy * 8, uy * (R + 4) + ux * 8, ux * (R + 4) + uy * 8, uy * (R + 4) - ux * 8);
+      // Connector: a quadratic curve from the entry side to the exit side,
+      // pulled toward the node centre and drawn as short straight pieces.
+      const c = new Phaser.Curves.QuadraticBezier(new V(e.inDir.x * R * 0.85, e.inDir.y * R * 0.85), new V(0, 0), new V(ux * R * 0.85, uy * R * 0.85));
+      g.lineStyle(5, e.color, 1);
+      let a = c.getPoint(0);
+      for (let i = 1; i <= 8; i++) {
+        const b = c.getPoint(i / 8);
+        g.lineBetween(a.x, a.y, b.x, b.y);
+        a = b;
+      }
+    }
+    g.lineStyle(3, n.state ? 0xff4fd8 : 0xffffff, 1);
+    g.strokeCircle(0, 0, R);
+  }
+
+  toggle(n) {
+    if (!n.active) return;
+    n.state ^= 1;
+    this.drawNode(n);
+    n.g.setScale(1.35);
+    this.tweens.add({ targets: n.g, scale: 1, duration: 140, ease: 'Back.easeOut' });
+    this.tone(n.state ? 620 : 440, 0.05, 'square', 0.05);
+  }
+
+  // ---------------------------------------------------------------- hud ---
+  buildHud() {
+    const d = 20;
+    this.add.rectangle(W / 2, 23, W, 46, 0x0d1019, 0.92).setDepth(d);
+    this.add.rectangle(W / 2, 46, W, 2, 0x232a3d).setDepth(d);
+    this.scoreTxt = this.label(16, 23, '000000', 26, '#ffffff', 0).setDepth(d);
+    // Combo bar ("Racha de Pasajeros"): a dark background rectangle, a neon
+    // foreground rectangle that fills as trains are routed in a row (plus a
+    // soft glow copy of it), four dividers marking the five steps, and a label.
+    const bx = 130;
+    const bw = 140;
+    this.add.rectangle(bx, 31, bw, 9, 0x1b2030).setOrigin(0, 0.5).setStrokeStyle(1, 0x3a4460).setDepth(d);
+    this.comboGlow = this.add.rectangle(bx, 31, bw, 19, COMBO_COLORS[0], 0.25).setOrigin(0, 0.5).setBlendMode(Phaser.BlendModes.ADD).setDepth(d);
+    this.comboFg = this.add.rectangle(bx, 31, bw, 9, COMBO_COLORS[0]).setOrigin(0, 0.5).setDepth(d);
+    this.comboGlow.scaleX = this.comboFg.scaleX = 0;
+    for (let i = 1; i < COMBO_STEP; i++) this.add.rectangle(bx + (bw * i) / COMBO_STEP, 31, 2, 9, 0x0d1019).setDepth(d);
+    this.comboTxt = this.label(bx, 14, 'COMBO: x1', 14, hex(COMBO_COLORS[0]), 0).setDepth(d);
+    this.rushLbl = this.label(W / 2, 33, '', 12, '#aab3c8').setDepth(d);
+    this.bar = this.add.graphics().setDepth(d);
+    this.livesLbl = this.label(704, 12, 'VIDAS', 11, '#aab3c8').setDepth(d);
+    this.pips = this.add.graphics({ x: 704, y: 31 }).setDepth(d);
+    this.rushTxt = this.label(W / 2, 525, '¡HORA PUNTA!', 40, '#ff4d6d').setDepth(d).setAlpha(0);
+    this.rushTxt.setShadow(0, 0, '#ff1f4b', 18, false, true);
+    this.drawHud();
+  }
+
+  label(x, y, s, size, color, ox) {
+    return this.add.text(x, y, s, { fontFamily: FONT, fontSize: size + 'px', fontStyle: 'bold', color: color || '#ffffff', align: 'center' }).setOrigin(ox === undefined ? 0.5 : ox, 0.5);
+  }
+
+  pipX(i) {
+    return (i - (MAX_LIVES - 1) / 2) * 22;
+  }
+
+  drawHud() {
+    this.scoreTxt.setText(pad6(this.score));
+    const g = this.pips;
+    g.clear();
+    for (let i = 0; i < MAX_LIVES; i++) {
+      const x = this.pipX(i);
+      if (i < this.lives) {
+        g.fillStyle(0xff4d6d, 1);
+        g.fillCircle(x, 0, 7);
+        g.fillStyle(0xffffff, 0.85);
+        g.fillCircle(x - 2, -2, 2);
+      } else {
+        g.lineStyle(2, 0x55607a, 1);
+        g.strokeCircle(x, 0, 6);
+      }
+    }
+  }
+
+  // ---------------------------------------------- racha de pasajeros ---
+  // A correctly routed train adds one step to the combo.
+  // COMBO_STEP steps raise the multiplier by one tier, up to MAX_COMBO.
+  comboStep() {
+    let up = false;
+    if (this.comboMultiplier < MAX_COMBO && ++this.consecutiveTrains >= COMBO_STEP) {
+      this.comboMultiplier++;
+      this.consecutiveTrains = 0;
+      up = true;
+    }
+    this.updateComboUI(up);
+  }
+
+  // A misrouted train or a collision throws the whole combo away.
+  comboReset() {
+    const had = this.comboMultiplier > 1 || this.consecutiveTrains > 0;
+    this.comboMultiplier = 1;
+    this.consecutiveTrains = 0;
+    this.updateComboUI(false);
+    if (had) {
+      this.comboTxt.setColor('#ff4d6d');
+      this.time.delayedCall(350, () => this.comboTxt.setColor(hex(COMBO_COLORS[this.comboMultiplier - 1])));
+    }
+  }
+
+  // Syncs the combo bar and label with comboMultiplier / consecutiveTrains.
+  // levelUp = true plays the tier-up juice (flash, new colour, small shake).
+  updateComboUI(levelUp) {
+    const m = this.comboMultiplier;
+    const maxed = m >= MAX_COMBO;
+    const col = COMBO_COLORS[m - 1];
+    const fill = maxed ? 1 : this.consecutiveTrains / COMBO_STEP; // 1 train = 20 %, 2 = 40 %...
+    const bars = [this.comboFg, this.comboGlow];
+    const paint = () => {
+      this.comboFg.setFillStyle(col);
+      this.comboGlow.setFillStyle(col, 0.25);
+    };
+    this.comboTxt.setText('COMBO: x' + m + (maxed ? ' MAX' : '')).setColor(hex(col));
+    this.tweens.killTweensOf(bars);
+    if (levelUp) {
+      // Top the bar off in the old colour, then restart it in the new one.
+      this.tweens.add({
+        targets: bars,
+        scaleX: 1,
+        duration: 130,
+        ease: 'Cubic.easeOut',
+        onComplete: () => {
+          paint();
+          this.comboFg.scaleX = this.comboGlow.scaleX = fill;
+        },
+      });
+      this.comboTxt.setColor('#ffffff').setScale(1.7);
+      this.tweens.add({ targets: this.comboTxt, scale: 1, duration: 380, ease: 'Back.easeOut' });
+      this.time.delayedCall(260, () => this.comboTxt.setColor(hex(COMBO_COLORS[this.comboMultiplier - 1])));
+      this.cameras.main.shake(140, 0.004);
+      this.float(200, 74, '¡RACHA x' + m + '!', hex(col), 20);
+      [0, 1, 2].forEach((i) => this.tone(520 + m * 80 + i * 180, 0.09, 'square', 0.05, 0, i * 0.06));
+    } else {
+      paint();
+      this.tweens.add({ targets: bars, scaleX: fill, duration: 220, ease: 'Cubic.easeOut' });
+    }
+  }
+
+  // Makes the score jump and flash gold when a bonus lands.
+  bumpScore() {
+    this.scoreTxt.setScale(1.45).setColor('#ffe14d');
+    this.tweens.add({ targets: this.scoreTxt, scale: 1, duration: 450, ease: 'Back.easeOut' });
+    this.time.delayedCall(700, () => this.scoreTxt.setColor('#ffffff'));
+  }
+
+  // Makes the lives counter jump so the change is noticed.
+  bumpLives(color, from) {
+    this.pips.setScale(from);
+    this.tweens.add({ targets: this.pips, scale: 1, duration: 450, ease: 'Back.easeOut' });
+    this.livesLbl.setColor(color);
+    this.time.delayedCall(900, () => this.livesLbl.setColor('#aab3c8'));
+  }
+
+  drawRushBar() {
+    const g = this.bar;
+    const P = this.phase;
+    const f = P === 'rush' ? 1 - this.cyc / RUSH_SECONDS : P === 'calm' ? this.cyc / CALM_SECONDS : 0;
+    g.clear();
+    g.fillStyle(0x1b2030, 1);
+    g.fillRoundedRect(290, 10, 220, 10, 5);
+    g.fillStyle(this.rush ? 0xff3347 : f > 0.85 ? 0xff8a3d : 0xffc928, 1);
+    if (f > 0.03) g.fillRoundedRect(290, 10, 220 * Math.min(1, f), 10, 5);
+    let s = '';
+    if (this.mode !== 'title') {
+      if (P === 'rush') s = '¡HORA PUNTA!  x2';
+      else if (P === 'calm') s = 'HORA PUNTA EN ' + Math.ceil(CALM_SECONDS - this.cyc);
+      else if (P === 'clear') s = 'DESPEJA LAS VÍAS';
+      else s = P === 'inaug' ? 'NUEVA LÍNEA' : P === 'bonus' ? 'BONO DE SUPERVIVENCIA' : 'RESPIRO';
+    }
+    if (s !== this.rushLbl.text) this.rushLbl.setText(s).setColor(this.rush ? '#ff4d6d' : '#aab3c8');
+  }
+
+  // -------------------------------------------------------------- input ---
+  bindInput() {
+    const held = {};
+    const down = (ev) => {
+      const c = KEY_TO_CODE[normKey(ev.key)];
+      if (!c) return;
+      ev.preventDefault();
+      if (!held[c]) {
+        held[c] = 1;
+        this.onCode(c);
+      }
+    };
+    const up = (ev) => {
+      const c = KEY_TO_CODE[normKey(ev.key)];
+      if (c) held[c] = 0;
+    };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    this.events.once('shutdown', () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+    });
+    this.input.on('pointerdown', () => {
+      if (this.mode === 'title' || this.mode === 'over') this.onCode('START1');
+    });
+  }
+
+  // All game input arrives here as arcade codes (P1_L, P2_3, START1...).
+  onCode(c) {
+    const ctx = this.sound.context;
+    if (ctx && ctx.state === 'suspended') ctx.resume();
+    const m = this.mode;
+    const start = c === 'START1' || c === 'START2';
+    const btn = /_[1-6]$/.test(c);
+    const k = c.slice(3); // 'L', 'U', '1'... shared by both players
+    if (m === 'title') {
+      if (start || btn) this.startGame();
+    } else if (m === 'play') {
+      if (start) this.setPause(true);
+      else for (const n of this.nodeList) if (n.keys.includes(k)) this.toggle(n);
+    } else if (m === 'pause') {
+      if (start) this.setPause(false);
+    } else if (this.time.now < this.lockUntil) {
+      return;
+    } else if (m === 'name') {
+      const ne = this.ne;
+      if (k === 'U' || k === 'D') ne.l[ne.p] = (ne.l[ne.p] + (k === 'U' ? 1 : 25)) % 26;
+      else if (k === 'L') ne.p = Math.max(0, ne.p - 1);
+      else if (k === 'R' || start || btn) {
+        if (ne.p < 2) ne.p++;
+        else if (k !== 'R') return this.submitName();
+      }
+      this.tone(520, 0.04, 'square', 0.04);
+      this.drawName();
+    } else if (m === 'over' && start) {
+      this.startGame();
+    }
+  }
+
+  // ------------------------------------------------------------ screens ---
+  clearUi() {
+    this.ui.removeAll(true);
+    this.blink = null;
+  }
+
+  dim(a) {
+    this.ui.add(this.add.rectangle(W / 2, H / 2 + 23, W, H - 46, 0x05060a, a));
+  }
+
+  uiText(x, y, s, size, color, ox) {
+    const t = this.label(x, y, s, size, color, ox);
+    this.ui.add(t);
+    return t;
+  }
+
+  board(y, mark) {
+    this.uiText(W / 2, y, 'MEJORES DESPACHADORES', 14, '#4de3ff');
+    for (let i = 0; i < 5; i++) {
+      const s = this.scores[i];
+      const me = s && mark && s === mark;
+      this.uiText(W / 2, y + 26 + i * 22, i + 1 + '. ' + (s ? s.n + '  ' + pad6(s.s) : '---  ------'), 16, me ? '#ffe14d' : s ? '#e8ecf5' : '#55607a');
+    }
+  }
+
+  resetRound() {
+    this.clearTrains();
+    this.clearUi();
+    for (const n of this.nodeList) {
+      n.state = 0;
+      n.last = -1e9;
+    }
+    this.score = 0;
+    this.comboMultiplier = 1;
+    this.consecutiveTrains = 0;
+    this.updateComboUI(false);
+    this.lives = START_LIVES;
+    this.t = 0;
+    this.cyc = 0;
+    this.ph = 0;
+    this.phase = 'calm';
+    this.rush = false;
+    this.sm = 1;
+    this.warn = 0;
+  }
+
+  showTitle() {
+    this.resetRound();
+    this.openLines(this.lineList.length); // attract mode shows the whole network
+    this.mode = 'title';
+    this.spawnT = 300;
+    this.drawHud();
+    this.dim(0.8);
+    this.uiText(W / 2, 104, 'COMBINACIÓN', 60, '#ffffff').setShadow(0, 0, '#ff3347', 20, false, true);
+    this.uiText(W / 2, 162, 'HORA PUNTA', 40, '#ffc928').setShadow(0, 0, '#ff8a3d', 16, false, true);
+    this.uiText(W / 2, 206, 'ERES EL DESPACHADOR DEL METRO DE SANTIAGO', 14, '#17d68a');
+    this.uiText(W / 2, 244, 'CADA TREN DEBE SALIR POR LA LÍNEA DE SU COLOR', 15, '#e8ecf5');
+    this.uiText(W / 2, 266, 'CAMBIA CADA DESVÍO CON SU BOTÓN (1 A 6) O LA PALANCA', 15, '#e8ecf5');
+    this.uiText(W / 2, 288, 'TREN MAL DESPACHADO: -1 VIDA  ·  CHOQUE: FIN DEL TURNO', 15, '#e8ecf5');
+    this.uiText(W / 2, 310, 'SUPERA LA HORA PUNTA: BONO POR VIDA, +1 VIDA Y NUEVA LÍNEA', 15, '#ffe14d');
+    this.board(356);
+    this.blink = this.uiText(W / 2, 540, 'PRESIONA START', 24, '#ffffff');
+  }
+
+  startGame() {
+    this.resetRound();
+    this.openLines(START_LINES);
+    this.spawnT = 700;
+    this.mode = 'play';
+    this.drawHud();
+    this.tone(440, 0.08, 'square', 0.05);
+    this.tone(660, 0.08, 'square', 0.05, 0, 0.09);
+    this.tone(880, 0.14, 'square', 0.05, 0, 0.18);
+  }
+
+  setPause(on) {
+    this.clearUi();
+    this.mode = on ? 'pause' : 'play';
+    if (on) {
+      this.dim(0.7);
+      this.uiText(W / 2, 280, 'PAUSA', 56, '#ffffff');
+      this.blink = this.uiText(W / 2, 340, 'START PARA SEGUIR', 18, '#aab3c8');
+    }
+  }
+
+  gameOver(title, sub) {
+    this.goTitle = title;
+    this.goSub = sub;
+    const top = this.scores;
+    const hi = this.score > 0 && (top.length < 5 || this.score > top[4].s);
+    this.overPanel(hi, null);
+  }
+
+  overPanel(entry, mark) {
+    this.clearUi();
+    this.lockUntil = this.time.now + 700;
+    this.idle = 0;
+    this.dim(0.82);
+    this.uiText(W / 2, 112, this.goTitle, 52, '#ff4d6d').setShadow(0, 0, '#ff1f4b', 18, false, true);
+    this.uiText(W / 2, 160, this.goSub, 15, '#aab3c8');
+    this.uiText(W / 2, 212, 'PUNTOS  ' + pad6(this.score), 30, '#ffffff');
+    if (entry) {
+      this.mode = 'name';
+      this.uiText(W / 2, 270, '¡NUEVO RÉCORD!  INGRESA TUS INICIALES', 16, '#ffe14d');
+      this.ne = { l: [0, 0, 0], p: 0, t: [0, 1, 2].map((i) => this.uiText(W / 2 - 60 + i * 60, 340, 'A', 60, '#ffffff')) };
+      this.ne.c = this.add.rectangle(0, 380, 44, 5, 0xffe14d);
+      this.ui.add(this.ne.c);
+      this.uiText(W / 2, 430, 'PALANCA: ELEGIR LETRA   ·   BOTÓN: SIGUIENTE', 14, '#aab3c8');
+      this.drawName();
+    } else {
+      this.mode = 'over';
+      this.board(278, mark);
+      this.blink = this.uiText(W / 2, 540, 'START: OTRO TURNO', 24, '#ffffff');
+    }
+  }
+
+  drawName() {
+    const ne = this.ne;
+    ne.t.forEach((t, i) => t.setText(String.fromCharCode(65 + ne.l[i])).setColor(i === ne.p ? '#ffe14d' : '#ffffff'));
+    ne.c.x = W / 2 - 60 + ne.p * 60;
+  }
+
+  submitName() {
+    const s = { n: this.ne.l.map((i) => String.fromCharCode(65 + i)).join(''), s: this.score };
+    this.scores.push(s);
+    this.scores.sort((a, b) => b.s - a.s);
+    this.scores.length = Math.min(5, this.scores.length);
+    getStorage().set(STORE_KEY, this.scores).catch(() => {});
+    this.tone(660, 0.1, 'square', 0.05);
+    this.tone(990, 0.2, 'square', 0.05, 0, 0.1);
+    this.overPanel(false, s);
+  }
+
+  loadScores() {
+    getStorage()
+      .get(STORE_KEY)
+      .then((r) => {
+        if (!r || !r.found || !Array.isArray(r.value)) return;
+        // Storage outlives releases: only trust entries with the expected shape.
+        this.scores = r.value
+          .filter((v) => v && typeof v.n === 'string' && Number.isFinite(v.s))
+          .map((v) => ({ n: v.n.slice(0, 3).toUpperCase(), s: Math.floor(v.s) }))
+          .sort((a, b) => b.s - a.s)
+          .slice(0, 5);
+        if (this.mode === 'title') this.showTitle();
+      })
+      .catch(() => {});
+  }
+
+  // --------------------------------------------------------------- loop ---
+  update(time, delta) {
+    const dt = Math.min(delta, 50) / 1000;
+    const m = this.mode;
+    if (this.blink) this.blink.setAlpha(0.55 + 0.45 * Math.sin(time / 180));
+    if (m === 'title') this.tick(dt, true);
+    else if (m === 'play') this.tick(dt, false);
+    else if (m === 'over' && (this.idle += dt) > 20) this.showTitle();
+
+    const on = this.rush && (m === 'play' || m === 'pause');
+    this.rushBg.setAlpha(on ? 0.07 + 0.06 * Math.sin(time / 90) : 0);
+    this.rushTxt.setAlpha(on ? 0.55 + 0.45 * Math.sin(time / 70) : 0);
+    this.drawRushBar();
+  }
+
+  baseSpeed() {
+    return 95 + Math.min(65, this.t * 0.5); // px per second, ramps up over ~2 min
+  }
+
+  // One simulation step. demo = attract mode behind the title (no scoring, no crashes).
+  tick(dt, demo) {
+    this.now += dt * 1000;
+    if (demo) {
+      if ((this.demoT -= dt) <= 0) {
+        this.demoT = 0.9;
+        const n = pick(this.nodeList);
+        n.state ^= 1;
+        this.drawNode(n);
+      }
+    } else {
+      this.t += dt;
+      this.stepPhase(dt);
+      this.music(dt);
+    }
+
+    // Rush hour doubles both train speed and spawn rate.
+    this.sm += ((this.rush ? 2 : 1) - this.sm) * Math.min(1, dt * 4);
+    // Trains only spawn in the calm and rush phases; the breather, the reward
+    // and the inauguration all keep the spawner switched off.
+    if (demo || this.phase === 'calm' || this.phase === 'rush') {
+      this.spawnT -= dt * 1000 * (this.rush ? 2 : 1);
+      if (this.spawnT <= 0) this.spawnT = this.spawn(demo) ? (demo ? 1100 : Math.max(1050, 3000 - this.t * 20)) : 200;
+    }
+
+    const v = this.baseSpeed() * this.sm;
+    for (const tr of this.trains.slice()) {
+      tr.d += v * tr.k * dt;
+      while (!tr.dead && tr.d >= tr.e.len) {
+        const n = tr.e.to;
+        if (!n) {
+          this.arrive(tr, demo);
+          break;
+        }
+        // Reached a switch: the node decides the next path right now.
+        tr.d -= tr.e.len;
+        tr.e = this.route(n, tr.e);
+        if (!demo && n.active) {
+          // NEAR MISS: another train went through this node a moment ago.
+          if (((this.now - n.last) / 1000) * v < 48) this.nearMiss(n);
+          n.last = this.now;
+        }
+      }
+      if (!tr.dead) this.place(tr);
+    }
+
+    if (demo) return;
+    // Collisions: two trains overlapping on the same piece of track.
+    const ts = this.trains;
+    for (let i = 0; i < ts.length; i++) {
+      for (let j = i + 1; j < ts.length; j++) {
+        const a = ts[i];
+        const b = ts[j];
+        if (a.e === b.e && Math.abs(a.d - b.d) < (a.len + b.len) / 2 - 3) return this.crash(a, b);
+      }
+    }
+  }
+
+  // ------------------------------------------------- rush hour sequence ---
+  // calm (30 s) -> rush (10 s) -> clear (wait for an empty map) -> bonus
+  // (lives x 500 tally) -> reward (+1 vida) -> inaug (next line lights up)
+  // -> calm again. Each step is timed with the phase timer `ph`, which only
+  // advances while the game is running, so pausing mid-sequence is safe and
+  // no two announcements can overlap.
+  stepPhase(dt) {
+    const P = this.phase;
+    if (P === 'calm') {
+      this.cyc += dt;
+      const left = Math.ceil(CALM_SECONDS - this.cyc);
+      if (left <= 0) this.startRush();
+      else if (left <= 3 && left !== this.warn) {
+        this.warn = left;
+        this.tone(880, 0.1, 'square', 0.06);
+      }
+    } else if (P === 'rush') {
+      if ((this.cyc += dt) >= RUSH_SECONDS) this.endRush();
+    } else if (P === 'clear') {
+      // The breather: wait at least a second and until the last train is gone.
+      if ((this.ph += dt) > 1 && !this.trains.length) this.bonus();
+    } else if (P === 'bonus') {
+      this.ph += dt;
+      const B = this.tally;
+      // Count the lives one by one so the maths visibly adds up.
+      while (B.n < B.lives && this.ph >= (B.n + 1) * 0.18) {
+        B.n++;
+        if (B.txt.active) B.txt.setText(B.n + ' x ' + LIFE_BONUS + ' = ' + B.n * LIFE_BONUS);
+        this.tone(500 + B.n * 90, 0.07, 'square', 0.05);
+      }
+      // 4. Apply the points one second in, and make the score jump.
+      if (!B.paid && this.ph >= 1) {
+        B.paid = true;
+        this.score += B.pts;
+        this.drawHud();
+        this.bumpScore();
+        this.tone(880, 0.1, 'triangle', 0.09);
+        this.tone(1320, 0.18, 'triangle', 0.09, 0, 0.08);
+      }
+      // 5. The tally has faded by now; the reward follows a second after the payout.
+      if (this.ph >= 2.1) this.reward();
+    } else {
+      if (P === 'inaug') {
+        // Fade the new line from grey to neon; its switches appear at full glow.
+        const L = this.newLine;
+        if (L.k < 1) {
+          L.k = Math.min(1, L.k + dt / 1.1);
+          this.drawLine(L);
+          if (L.k === 1) this.refreshNodes(true);
+        }
+      }
+      if ((this.ph -= dt) <= 0) {
+        if (P === 'reward' && this.lineList.some((L) => !L.on)) this.inaugurate();
+        else this.resume();
+      }
+    }
+  }
+
+  startRush() {
+    this.phase = 'rush';
+    this.rush = true;
+    this.cyc = 0;
+    this.cameras.main.flash(250, 255, 60, 90);
+    this.banner('¡HORA PUNTA!', 300, 76, '#ffffff', '#ff1f4b', 500);
+    for (let i = 0; i < 3; i++) this.tone(500, 0.3, 'sawtooth', 0.07, 1000, i * 0.3);
+  }
+
+  // 1. The breather: rush is over, spawning stops, trains on the map finish.
+  endRush() {
+    this.phase = 'clear';
+    this.rush = false;
+    this.cyc = 0;
+    this.ph = 0;
+    this.tone(330, 0.25, 'triangle', 0.08, 220);
+  }
+
+  // 2 + 3. Bono de Supervivencia: 500 points for every life held right now.
+  // The life granted afterwards by reward() is deliberately not counted.
+  bonus() {
+    const lives = this.lives;
+    this.phase = 'bonus';
+    this.ph = 0;
+    this.banner('BONO DE SUPERVIVENCIA', 266, 32, '#ffe14d', '#ff8a3d', 1450);
+    this.tally = { lives, n: 0, paid: false, pts: lives * LIFE_BONUS, txt: this.banner('0 x ' + LIFE_BONUS + ' = 0', 322, 48, '#ffffff', '#ffe14d', 1450) };
+  }
+
+  // 5. The reward: celebratory text, +1 life (capped) and a HUD bump.
+  reward() {
+    const more = this.lineList.some((L) => !L.on);
+    this.phase = 'reward';
+    // The banner lasts about 1.8 s; the inauguration starts 1 s after it fades.
+    this.ph = more ? 2.8 : 2.2;
+    const got = this.lives < MAX_LIVES;
+    if (got) this.lives++;
+    this.drawHud();
+    this.banner('¡HORA PUNTA SUPERADA!', 262, 40, '#ffffff', '#17d68a', 1300);
+    this.banner(got ? '+1 VIDA' : 'VIDAS AL MÁXIMO', 322, 54, '#17d68a', '#17d68a', 1300);
+    if (got) {
+      this.bumpLives('#17d68a', 2);
+      this.ping(704 + this.pipX(this.lives - 1), 31, 0x17d68a, 46, 21);
+    }
+    [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.16, 'triangle', 0.09, 0, i * 0.1));
+  }
+
+  // 6. The inauguration: announce the next grey line and light it up.
+  inaugurate() {
+    const L = this.lineList.find((x) => !x.on);
+    L.on = true;
+    this.newLine = L;
+    this.phase = 'inaug';
+    this.ph = 2.4;
+    this.banner('¡INAUGURACIÓN LÍNEA ' + L.label.slice(1) + '!', 290, 42, hex(L.color), hex(L.color), 1500);
+    for (const e of L.edges) {
+      if (!e.from) this.ping(e.sx, e.sy, L.color, 80);
+      if (!e.to) this.ping(e.ex, e.ey, L.color, 80);
+    }
+    [392, 523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.2, 'square', 0.05, 0, i * 0.12));
+  }
+
+  // Back to normal: spawner on (new line included), countdown restarts.
+  resume() {
+    this.phase = 'calm';
+    this.cyc = 0;
+    this.warn = 0;
+    this.spawnT = 500;
+  }
+
+  place(tr) {
+    const e = tr.e;
+    const p = e.path.getPoint(Math.min(0.9999, tr.d / e.len), this.v1);
+    const q = e.path.getPoint(Math.min(1, (tr.d + 6) / e.len), this.v2);
+    if (!p) return;
+    tr.img.setPosition(p.x, p.y);
+    if (q && (q.x !== p.x || q.y !== p.y)) tr.img.rotation = Math.atan2(q.y - p.y, q.x - p.x);
+  }
+
+  spawn(demo) {
+    const ex = !demo && this.t > 45 && rnd() < 0.18; // express trains: 40% faster
+    // Only open lines spawn trains. Never spawn on top of a train, and never
+    // put an express behind a slower one.
+    const free = this.entries.filter((e) => e.L.on && !this.trains.some((t) => t.e === e && (ex || t.d < 75)));
+    if (!free.length) return false;
+    const e = pick(free);
+    // Early on most trains simply belong on the line they arrive on.
+    const own = !demo && rnd() < Math.max(0.3, 0.75 - this.t * 0.006);
+    const reach = this.reach(e);
+    const others = reach.filter((l) => l !== e.line);
+    const line = own || !others.length ? e.line : pick(demo ? reach : others);
+    const tr = { e, d: 0, k: ex ? 1.4 : 1, len: ex ? 34 : 26, line, color: LINES[line].color, dead: false };
+    tr.img = this.add.image(-99, -99, 't' + line + (ex ? 1 : 0)).setDepth(6);
+    this.trains.push(tr);
+    this.place(tr);
+    if (!demo) {
+      this.ping(e.sx, e.sy, tr.color, 26);
+      if (ex) {
+        this.float(Phaser.Math.Clamp(e.sx, 60, W - 60), e.sy - 22, 'EXPRESO', '#ffffff', 13);
+        this.tone(1200, 0.12, 'sawtooth', 0.04, 1800);
+      }
+    }
+    return true;
+  }
+
+  kill(tr) {
+    tr.dead = true;
+    tr.img.destroy();
+    const i = this.trains.indexOf(tr);
+    if (i >= 0) this.trains.splice(i, 1);
+  }
+
+  clearTrains() {
+    for (const tr of this.trains) tr.img.destroy();
+    this.trains = [];
+  }
+
+  arrive(tr, demo) {
+    const e = tr.e;
+    this.kill(tr);
+    if (demo) return;
+    if (e.line === tr.line) {
+      // Success: score Base Points x comboMultiplier (doubled in rush hour),
+      // then count the train toward the next combo tier.
+      const pts = BASE_POINTS * this.comboMultiplier * (this.rush ? 2 : 1);
+      this.score += pts;
+      this.ping(e.ex, e.ey, tr.color, 44);
+      this.float(e.ex, e.ey - 30, '+' + pts, hex(tr.color), 20);
+      this.tone(520 + this.comboMultiplier * 60, 0.09, 'triangle', 0.09);
+      this.tone(780 + this.comboMultiplier * 90, 0.14, 'triangle', 0.09, 0, 0.07);
+      this.comboStep();
+    } else {
+      // Wrong terminal: lose a life and the whole combo.
+      this.lives--;
+      this.comboReset();
+      this.ping(e.ex, e.ey, 0xff3347, 44);
+      this.float(Phaser.Math.Clamp(e.ex, 70, W - 70), e.ey - 30, 'RECLAMO  -1 VIDA', '#ff4d6d', 16);
+      this.bumpLives('#ff4d6d', 0.5);
+      this.cameras.main.shake(160, 0.006);
+      this.tone(160, 0.3, 'sawtooth', 0.09, 70);
+      if (this.lives <= 0) {
+        this.mode = 'crash';
+        this.time.delayedCall(800, () => this.gameOver('LÍNEA SUSPENDIDA', 'TE QUEDASTE SIN VIDAS'));
+      }
+    }
+    this.drawHud();
+  }
+
+  // Near miss: bonus points only; the combo bar moves on delivered trains.
+  nearMiss(n) {
+    const pts = BASE_POINTS * this.comboMultiplier;
+    this.score += pts;
+    this.float(n.x, n.y - 58, '¡POR UN PELO! +' + pts, '#4de3ff', 18);
+    this.ping(n.x, n.y, 0x4de3ff, 60);
+    this.tone(1320, 0.07, 'square', 0.05);
+    this.tone(1760, 0.1, 'square', 0.05, 0, 0.06);
+    this.drawHud();
+  }
+
+  crash(a, b) {
+    this.mode = 'crash';
+    this.comboReset();
+    const x = (a.img.x + b.img.x) / 2;
+    const y = (a.img.y + b.img.y) / 2;
+    const cols = [a.color, b.color, 0xffffff, 0xff8a3d];
+    this.kill(a);
+    this.kill(b);
+    this.cameras.main.shake(750, 0.035);
+    this.cameras.main.flash(180, 255, 255, 255);
+    this.ping(x, y, 0xffffff, 240);
+    this.ping(x, y, 0xff8a3d, 140);
+    // Explosion made of plain shapes: squares, circles and triangles.
+    for (let i = 0; i < 54; i++) {
+      const s = 5 + rnd() * 11;
+      const c = pick(cols);
+      const o = i % 3 === 0 ? this.add.rectangle(x, y, s, s, c) : i % 3 === 1 ? this.add.circle(x, y, s / 2, c) : this.add.triangle(x, y, 0, s, s / 2, 0, s, s, c);
+      const ang = rnd() * 6.283;
+      const dist = 50 + rnd() * 260;
+      o.setDepth(9);
+      this.tweens.add({ targets: o, x: x + Math.cos(ang) * dist, y: y + Math.sin(ang) * dist, angle: rnd() * 720 - 360, alpha: 0, scale: 0.3, duration: 600 + rnd() * 900, ease: 'Cubic.easeOut', onComplete: () => o.destroy() });
+    }
+    this.noise(0.9, 0.3);
+    this.tone(220, 0.8, 'sawtooth', 0.14, 30);
+    this.time.delayedCall(1500, () => this.gameOver('¡COLISIÓN!', 'DOS TRENES EN LA MISMA VÍA'));
+  }
+
+  // ----------------------------------------------------------------- fx ---
+  ping(x, y, color, size, depth) {
+    const c = this.add.circle(x, y, 10).setStrokeStyle(3, color).setDepth(depth || 8);
+    this.tweens.add({ targets: c, scale: size / 10, alpha: 0, duration: 420, ease: 'Cubic.easeOut', onComplete: () => c.destroy() });
+  }
+
+  float(x, y, s, color, size) {
+    const t = this.label(x, y, s, size, color).setDepth(9);
+    t.setStroke('#05060a', 4);
+    this.tweens.add({ targets: t, y: y - 34, alpha: 0, duration: 1000, ease: 'Cubic.easeIn', onComplete: () => t.destroy() });
+  }
+
+  // Big centre-screen announcement: zooms in, holds for `hold` ms, fades out.
+  banner(s, y, size, color, glow, hold) {
+    const t = this.label(W / 2, y, s, size, color).setDepth(25).setScale(1.8).setAlpha(0);
+    t.setStroke('#05060a', 6);
+    t.setPadding(30); // room for the glow, otherwise it is clipped into a box
+    if (glow) t.setShadow(0, 0, glow, 18, false, true);
+    this.tweens.add({ targets: t, scale: 1, alpha: 1, duration: 250, ease: 'Cubic.easeOut', yoyo: true, hold, onComplete: () => t.destroy() });
+    return t;
+  }
+
+  // -------------------------------------------------------------- audio ---
+  // All sound is synthesised with Web Audio oscillators; no audio files.
+  tone(f, dur, type, vol, to, at) {
+    const c = this.sound.context;
+    if (!c) return;
+    try {
+      const t = c.currentTime + (at || 0);
+      const o = c.createOscillator();
+      const g = c.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(f, t);
+      if (to) o.frequency.exponentialRampToValueAtTime(to, t + dur);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      o.connect(g);
+      g.connect(c.destination);
+      o.start(t);
+      o.stop(t + dur + 0.02);
+    } catch (err) {
+      /* audio is optional */
+    }
+  }
+
+  noise(dur, vol) {
+    const c = this.sound.context;
+    if (!c) return;
+    try {
+      if (!this.nbuf) {
+        this.nbuf = c.createBuffer(1, c.sampleRate, c.sampleRate);
+        const d = this.nbuf.getChannelData(0);
+        for (let i = 0; i < d.length; i++) d[i] = rnd() * 2 - 1;
+      }
+      const s = c.createBufferSource();
+      const g = c.createGain();
+      s.buffer = this.nbuf;
+      g.gain.setValueAtTime(vol, c.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+      s.connect(g);
+      g.connect(c.destination);
+      s.start();
+      s.stop(c.currentTime + dur);
+    } catch (err) {
+      /* audio is optional */
+    }
+  }
+
+  // Tiny step sequencer: a bass pulse that speeds up and gains an alarm in
+  // rush hour, and drops to a slow heartbeat during the breather.
+  music(dt) {
+    if ((this.beatT -= dt) > 0) return;
+    const calm = this.phase === 'calm';
+    this.beatT += this.rush ? 0.11 : calm ? Math.max(0.15, 0.21 - this.t * 0.0004) : 0.28;
+    const i = this.beat++ % 16;
+    if (BASS[i]) this.tone(BASS[i] * (this.rush ? 1.5 : 1), 0.16, 'sawtooth', 0.04);
+    if (i % 2 && (calm || this.rush)) this.noise(0.03, 0.02);
+    if (this.rush && i % 4 === 0) this.tone(i % 8 ? 660 : 880, 0.09, 'square', 0.03);
+  }
 }
 
-async function storageSet(key, value) {
-  return getStorage().set(key, value);
-}
+new Phaser.Game({
+  type: Phaser.AUTO,
+  width: W,
+  height: H,
+  parent: 'game-root',
+  backgroundColor: '#090b11',
+  scale: {
+    mode: Phaser.Scale.FIT,
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+    width: W,
+    height: H,
+  },
+  scene: HoraPunta,
+});
