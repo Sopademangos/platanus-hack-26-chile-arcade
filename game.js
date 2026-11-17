@@ -16,7 +16,8 @@ const COMBO_STEP = 5; // consecutive trains needed to raise the multiplier
 const COMBO_COLORS = [0x3d8bff, 0x17d68a, 0xffc928, 0xff8a3d, 0xff4fd8];
 const MAX_COMBO = COMBO_COLORS.length;
 const START_LINES = 2; // how many entries of LINES are open when a game begins
-const CALM_SECONDS = 30; // time between rush hours
+const FIRST_CALM = 15; // seconds from the start of a game to the first rush hour
+const NEXT_CALM = 25; // seconds of normal play after each inauguration
 const RUSH_SECONDS = 10; // rush hour length
 const FONT = 'monospace';
 
@@ -575,7 +576,7 @@ class HoraPunta extends Phaser.Scene {
   drawRushBar() {
     const g = this.bar;
     const P = this.phase;
-    const f = P === 'rush' ? 1 - this.cyc / RUSH_SECONDS : P === 'calm' ? this.cyc / CALM_SECONDS : 0;
+    const f = P === 'rush' ? 1 - this.cyc / RUSH_SECONDS : P === 'calm' ? this.cyc / this.calmLen : 0;
     g.clear();
     g.fillStyle(0x1b2030, 1);
     g.fillRoundedRect(290, 10, 220, 10, 5);
@@ -584,8 +585,8 @@ class HoraPunta extends Phaser.Scene {
     let s = '';
     if (this.mode !== 'title') {
       if (P === 'rush') s = '¡HORA PUNTA!  x2';
-      else if (P === 'calm') s = 'HORA PUNTA EN ' + Math.ceil(CALM_SECONDS - this.cyc);
-      else if (P === 'clear') s = 'DESPEJA LAS VÍAS';
+      else if (P === 'calm') s = 'HORA PUNTA EN ' + Math.ceil(this.calmLen - this.cyc);
+      else if (P === 'clear') s = 'DESPEJA LAS VÍAS  x2';
       else s = P === 'inaug' ? 'NUEVA LÍNEA' : P === 'bonus' ? 'BONO DE SUPERVIVENCIA' : 'RESPIRO';
     }
     if (s !== this.rushLbl.text) this.rushLbl.setText(s).setColor(this.rush ? '#ff4d6d' : '#aab3c8');
@@ -689,6 +690,7 @@ class HoraPunta extends Phaser.Scene {
     this.lives = START_LIVES;
     this.t = 0;
     this.cyc = 0;
+    this.calmLen = FIRST_CALM; // wave 1 arrives fast; resume() sets NEXT_CALM
     this.ph = 0;
     this.phase = 'calm';
     this.rush = false;
@@ -877,16 +879,17 @@ class HoraPunta extends Phaser.Scene {
   }
 
   // ------------------------------------------------- rush hour sequence ---
-  // calm (30 s) -> rush (10 s) -> clear (wait for an empty map) -> bonus
-  // (lives x 500 tally) -> reward (+1 vida) -> inaug (next line lights up)
-  // -> calm again. Each step is timed with the phase timer `ph`, which only
-  // advances while the game is running, so pausing mid-sequence is safe and
-  // no two announcements can overlap.
+  // calm (15 s first, 25 s after) -> rush (10 s) -> clear (no spawning, but
+  // still 2x speed until the map is empty) -> bonus (lives x 500 tally) ->
+  // reward (+1 vida) -> inaug (next line lights up) -> calm again.
+  // Instead of Phaser timers, every step runs on `cyc`/`ph`, which only
+  // advance while the game is running. That way pausing is safe at any
+  // point and no two announcements can overlap.
   stepPhase(dt) {
     const P = this.phase;
     if (P === 'calm') {
       this.cyc += dt;
-      const left = Math.ceil(CALM_SECONDS - this.cyc);
+      const left = Math.ceil(this.calmLen - this.cyc);
       if (left <= 0) this.startRush();
       else if (left <= 3 && left !== this.warn) {
         this.warn = left;
@@ -895,8 +898,9 @@ class HoraPunta extends Phaser.Scene {
     } else if (P === 'rush') {
       if ((this.cyc += dt) >= RUSH_SECONDS) this.endRush();
     } else if (P === 'clear') {
-      // The breather: wait at least a second and until the last train is gone.
-      if ((this.ph += dt) > 1 && !this.trains.length) this.bonus();
+      // Rush hour stays on (2x speed, pulse, x2 points) until the last rush
+      // train has left the map; then the celebration starts straight away.
+      if (!this.trains.length) this.bonus();
     } else if (P === 'bonus') {
       this.ph += dt;
       const B = this.tally;
@@ -943,19 +947,22 @@ class HoraPunta extends Phaser.Scene {
     for (let i = 0; i < 3; i++) this.tone(500, 0.3, 'sawtooth', 0.07, 1000, i * 0.3);
   }
 
-  // 1. The breather: rush is over, spawning stops, trains on the map finish.
+  // 1. The 10 s are up: only spawning stops. `rush` stays true, so the
+  // trains still on the map keep their 2x speed and the screen keeps pulsing.
   endRush() {
     this.phase = 'clear';
-    this.rush = false;
     this.cyc = 0;
     this.ph = 0;
     this.tone(330, 0.25, 'triangle', 0.08, 220);
   }
 
-  // 2 + 3. Bono de Supervivencia: 500 points for every life held right now.
-  // The life granted afterwards by reward() is deliberately not counted.
+  // 2 + 3. The map is empty: rush hour really ends here (speed back to 1x,
+  // pulse off). Bono de Supervivencia: 500 points for every life held right
+  // now. The life granted afterwards by reward() is deliberately not counted.
   bonus() {
     const lives = this.lives;
+    this.rush = false;
+    this.sm = 1;
     this.phase = 'bonus';
     this.ph = 0;
     this.banner('BONO DE SUPERVIVENCIA', 266, 32, '#ffe14d', '#ff8a3d', 1450);
@@ -995,9 +1002,11 @@ class HoraPunta extends Phaser.Scene {
     [392, 523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.2, 'square', 0.05, 0, i * 0.12));
   }
 
-  // Back to normal: spawner on (new line included), countdown restarts.
+  // Back to normal: spawner on (new line included), and the countdown to
+  // the next rush hour restarts at NEXT_CALM (25 s).
   resume() {
     this.phase = 'calm';
+    this.calmLen = NEXT_CALM;
     this.cyc = 0;
     this.warn = 0;
     this.spawnT = 500;
@@ -1188,7 +1197,8 @@ class HoraPunta extends Phaser.Scene {
   }
 
   // Tiny step sequencer: a bass pulse that speeds up and gains an alarm in
-  // rush hour, and drops to a slow heartbeat during the breather.
+  // rush hour (including the clear-out), and drops to a slow heartbeat
+  // during the bonus, reward and inauguration.
   music(dt) {
     if ((this.beatT -= dt) > 0) return;
     const calm = this.phase === 'calm';
